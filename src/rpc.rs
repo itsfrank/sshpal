@@ -228,6 +228,14 @@ mod tests {
                 "echo first; sleep 0.2; echo second; exit 0".to_string(),
             ],
         );
+        tasks.insert(
+            "no_newline".to_string(),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf out".to_string(),
+            ],
+        );
         Config {
             ssh_target: "me@example".to_string(),
             local_root: "/tmp/local".into(),

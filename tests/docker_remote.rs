@@ -23,12 +23,12 @@ fn ubuntu_container_remote_client_replays_output_and_exit_code() -> Result<()> {
         "unexpected remote exit status\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("from stdout"),
-        "stdout from stub daemon was not relayed through remote call: {stdout}"
+        stdout.contains("from stdout\nsecond stdout line\nPROMPT\n"),
+        "stdout from stub daemon did not preserve newlines: {stdout}"
     );
     assert!(
-        stderr.contains("from stderr"),
-        "stderr from stub daemon was not relayed through remote call: {stderr}"
+        stderr.contains("from stderr\nsecond stderr line\n"),
+        "stderr from stub daemon did not preserve newlines: {stderr}"
     );
     Ok(())
 }
@@ -101,7 +101,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         events = [
             {{'type': 'stdout', 'chunk': 'from stdout\n'}},
+            {{'type': 'stdout', 'chunk': 'second stdout line\n'}},
             {{'type': 'stderr', 'chunk': 'from stderr\n'}},
+            {{'type': 'stderr', 'chunk': 'second stderr line\n'}},
             {{'type': 'exit', 'code': 7}},
         ]
         for event in events:
@@ -131,8 +133,11 @@ fn run_remote_container(project_dir: &Path) -> Result<std::process::Output> {
              exit 1; \
          fi; \
          cd /project; \
+         set +e; \
          sshpal-run test; \
          status=$?; \
+         set -e; \
+         printf 'PROMPT\n'; \
          if [ $status -ne 0 ]; then \
              echo '--- rpc stub log ---' >&2; \
              cat /tmp/rpc_stub.log >&2 || true; \

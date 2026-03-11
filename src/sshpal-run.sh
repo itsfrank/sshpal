@@ -58,10 +58,10 @@ tab=$(printf '\t')
 while IFS="$tab" read -r kind payload; do
     case "$kind" in
         stdout)
-            printf '%s' "$(printf '%s' "$payload" | jq -Rr '@base64d')"
+            printf '%s' "$payload" | jq -Rr '@base64d'
             ;;
         stderr)
-            printf '%s' "$(printf '%s' "$payload" | jq -Rr '@base64d')" >&2
+            printf '%s' "$payload" | jq -Rr '@base64d' >&2
             ;;
         exit)
             exit_code=$payload
