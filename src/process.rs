@@ -215,6 +215,22 @@ mod tests {
     }
 
     #[test]
+    fn builds_rsync_pull_command() {
+        let spec = rsync_command(
+            &config(),
+            &SyncPlan {
+                direction: SyncDirection::Pull,
+                relative_path: PathBuf::from("foo"),
+                local_path: PathBuf::from("/local/foo"),
+                remote_path: PathBuf::from("/remote/foo"),
+            },
+        );
+        assert_eq!(spec.program, OsString::from("rsync"));
+        assert_eq!(spec.args[4].to_string_lossy(), "me@example:/remote/foo");
+        assert_eq!(spec.args[5].to_string_lossy(), "/local/foo");
+    }
+
+    #[test]
     fn builds_reverse_tunnel_command() {
         let spec = reverse_tunnel_command(&config());
         assert_eq!(spec.program, OsString::from("ssh"));
@@ -230,5 +246,47 @@ mod tests {
         assert_eq!(prep.program, OsString::from("ssh"));
         assert_eq!(copy.program, OsString::from("scp"));
         assert_eq!(fin.program, OsString::from("ssh"));
+    }
+
+    #[test]
+    fn builds_cargo_zigbuild_command() {
+        let spec = cargo_zigbuild_command(&RemoteArch::Aarch64);
+        assert_eq!(spec.program, OsString::from("cargo"));
+        assert_eq!(
+            spec.args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            vec!["zigbuild", "--release", "--target", "aarch64-unknown-linux-musl"]
+        );
+    }
+
+    #[test]
+    fn command_spec_builder_sets_args_and_cwd() {
+        let spec = CommandSpec::new("echo")
+            .arg("hello")
+            .args(["world"])
+            .cwd("/tmp");
+        assert_eq!(spec.program, OsString::from("echo"));
+        assert_eq!(
+            spec.args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            vec!["hello", "world"]
+        );
+        assert_eq!(spec.cwd, Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn recording_runner_can_fail_on_program() {
+        let runner = RecordingRunner::default();
+        runner.fail_on("scp");
+        let err = runner.run(&CommandSpec::new("scp")).unwrap_err().to_string();
+        assert!(err.contains("forced failure"));
+    }
+
+    #[test]
+    fn system_runner_reports_non_zero_exit() {
+        let runner = SystemRunner;
+        let err = runner
+            .run(&CommandSpec::new("sh").args(["-c", "exit 7"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed with status 7"));
     }
 }

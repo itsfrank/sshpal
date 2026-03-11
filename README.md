@@ -209,3 +209,30 @@ cargo test --test docker_remote -- --ignored --nocapture
 ```
 
 That test requires Docker, network access for image/package pulls, and extra time to build the Linux binary in-container.
+
+## Coverage
+
+Generate code coverage with:
+
+```sh
+./scripts/coverage.sh
+```
+
+This uses `cargo-llvm-cov` and writes:
+
+- HTML report: `target/coverage/html/index.html`
+- LCOV report: `target/coverage/lcov.info`
+
+If `cargo-llvm-cov` is not installed, the script will fail with the install command:
+
+```sh
+cargo install cargo-llvm-cov
+```
+
+To include the ignored Docker integration test in coverage, run:
+
+```sh
+./scripts/coverage.sh --include-docker
+```
+
+That requires Docker and is much slower than the default coverage run.
