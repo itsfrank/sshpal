@@ -44,6 +44,7 @@ struct RpcState {
 }
 
 pub async fn serve(config: Config) -> Result<()> {
+    let rpc_port = config.rpc_port;
     let state = RpcState {
         tasks: config.tasks,
     };
@@ -63,18 +64,24 @@ pub async fn serve(config: Config) -> Result<()> {
             return Err(err).with_context(|| format!("failed to bind RPC server on {}", addr));
         }
     };
+    eprintln!("sshpal: serve startup finished; listening on http://{addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .context("RPC server failed")
+        .with_context(|| format!("RPC server failed on port {rpc_port}"))
 }
 
 async fn run_task(
     State(state): State<RpcState>,
     Json(request): Json<RpcRequest>,
 ) -> Result<Response, RpcResponseError> {
+    eprintln!(
+        "sshpal: task invoked `{}`{}",
+        request.task,
+        format_invocation_args(&request.args)
+    );
     let base = state.tasks.get(&request.task).cloned().ok_or_else(|| {
         RpcResponseError::new(
             StatusCode::NOT_FOUND,
@@ -141,6 +148,14 @@ async fn run_task(
         HeaderValue::from_static("application/x-ndjson"),
     );
     Ok(response)
+}
+
+fn format_invocation_args(args: &[String]) -> String {
+    if args.is_empty() {
+        String::new()
+    } else {
+        format!(" with args [{}]", args.join(", "))
+    }
 }
 
 async fn pump_reader<R>(

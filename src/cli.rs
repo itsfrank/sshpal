@@ -59,6 +59,10 @@ fn sync(path: PathBuf, direction: SyncDirection, runner: SharedRunner) -> Result
 
 async fn serve_with(runner: SharedRunner) -> Result<()> {
     let loaded = discover_config(&std::env::current_dir()?)?;
+    eprintln!(
+        "sshpal: installing remote helper to {} on {}",
+        loaded.config.remote_bin_path, loaded.config.ssh_target
+    );
     install_remote_helper(&loaded.config, runner)?;
 
     let mut tunnel = Command::new("ssh")
@@ -67,6 +71,10 @@ async fn serve_with(runner: SharedRunner) -> Result<()> {
         .stderr(Stdio::inherit())
         .spawn()
         .context("failed to spawn reverse SSH tunnel")?;
+    eprintln!(
+        "sshpal: reverse tunnel started for 127.0.0.1:{}",
+        loaded.config.rpc_port
+    );
 
     let server_result = rpc::serve(loaded.config).await;
     let _ = tunnel.kill().await;
