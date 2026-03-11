@@ -3,19 +3,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
 use serde::Deserialize;
 
 pub const CONFIG_FILE_NAME: &str = ".sshpal.toml";
 pub const DEFAULT_RPC_PORT: u16 = 45_678;
-pub const DEFAULT_REMOTE_BIN_PATH: &str = "~/.local/bin/sshpal";
+pub const DEFAULT_REMOTE_BIN_PATH: &str = "~/.local/bin/sshpal-run";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Config {
     pub ssh_target: String,
     pub local_root: PathBuf,
     pub remote_root: PathBuf,
-    pub remote_arch: RemoteArch,
     #[serde(default = "default_rpc_port")]
     pub rpc_port: u16,
     #[serde(default = "default_remote_bin_path")]
@@ -29,29 +27,12 @@ struct RawConfig {
     ssh_target: String,
     local_root: Option<PathBuf>,
     remote_root: PathBuf,
-    remote_arch: RemoteArch,
     #[serde(default = "default_rpc_port")]
     rpc_port: u16,
     #[serde(default = "default_remote_bin_path")]
     remote_bin_path: String,
     #[serde(default)]
     tasks: BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteArch {
-    X86_64,
-    Aarch64,
-}
-
-impl RemoteArch {
-    pub fn target_triple(&self) -> &'static str {
-        match self {
-            Self::X86_64 => "x86_64-unknown-linux-musl",
-            Self::Aarch64 => "aarch64-unknown-linux-musl",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,9 +80,10 @@ impl RawConfig {
     fn resolve(self, project_root: &Path) -> Config {
         Config {
             ssh_target: self.ssh_target,
-            local_root: self.local_root.unwrap_or_else(|| project_root.to_path_buf()),
+            local_root: self
+                .local_root
+                .unwrap_or_else(|| project_root.to_path_buf()),
             remote_root: self.remote_root,
-            remote_arch: self.remote_arch,
             rpc_port: self.rpc_port,
             remote_bin_path: self.remote_bin_path,
             tasks: self.tasks,
@@ -143,7 +125,6 @@ mod tests {
         r#"
 ssh_target = "me@example"
 remote_root = "/remote/project"
-remote_arch = "x86_64"
 
 [tasks]
 test = ["cargo", "test"]
@@ -157,7 +138,6 @@ test = ["cargo", "test"]
             ssh_target: String::new(),
             local_root: PathBuf::from("/tmp/local"),
             remote_root: PathBuf::from("/tmp/remote"),
-            remote_arch: RemoteArch::X86_64,
             rpc_port: DEFAULT_RPC_PORT,
             remote_bin_path: DEFAULT_REMOTE_BIN_PATH.to_string(),
             tasks: BTreeMap::new(),
@@ -198,7 +178,8 @@ test = ["cargo", "test"]
 
     #[test]
     fn minimal_example_config_stays_valid() {
-        let raw: RawConfig = toml::from_str(include_str!("../examples/minimal.sshpal.toml")).unwrap();
+        let raw: RawConfig =
+            toml::from_str(include_str!("../examples/minimal.sshpal.toml")).unwrap();
         let project_root = Path::new("/tmp/example-project");
         let config = raw.resolve(project_root);
         config.validate().unwrap();
@@ -211,14 +192,15 @@ test = ["cargo", "test"]
 
     #[test]
     fn complete_example_config_stays_valid() {
-        let raw: RawConfig = toml::from_str(include_str!("../examples/complete.sshpal.toml")).unwrap();
+        let raw: RawConfig =
+            toml::from_str(include_str!("../examples/complete.sshpal.toml")).unwrap();
         let project_root = Path::new("/tmp/example-project");
         let config = raw.resolve(project_root);
         config.validate().unwrap();
         assert_eq!(config.local_root, PathBuf::from("/tmp/local-worktree"));
         assert_eq!(config.remote_root, PathBuf::from("/work/project"));
         assert_eq!(config.rpc_port, 40_001);
-        assert_eq!(config.remote_bin_path, "~/bin/sshpal-custom");
+        assert_eq!(config.remote_bin_path, "~/bin/sshpal-run-custom");
         assert_eq!(
             config.tasks.get("lint").unwrap(),
             &vec![

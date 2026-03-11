@@ -19,9 +19,13 @@ pub struct SyncPlan {
 pub fn relative_cwd(local_root: &Path, cwd: &Path) -> Result<PathBuf> {
     let local_root = local_root.canonicalize()?;
     let cwd = cwd.canonicalize()?;
-    let rel = cwd
-        .strip_prefix(&local_root)
-        .map_err(|_| anyhow::anyhow!("cwd {} is not under {}", cwd.display(), local_root.display()))?;
+    let rel = cwd.strip_prefix(&local_root).map_err(|_| {
+        anyhow::anyhow!(
+            "cwd {} is not under {}",
+            cwd.display(),
+            local_root.display()
+        )
+    })?;
     Ok(rel.to_path_buf())
 }
 
@@ -69,8 +73,8 @@ pub fn build_sync_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn resolves_nested_dot() {

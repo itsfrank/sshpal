@@ -2,11 +2,10 @@
 
 `sshpal` is a Rust CLI for working with a remote Linux machine over SSH when that machine cannot fetch code or build tools from the internet.
 
-It provides three main features:
+It provides two main features:
 
 - project-aware `push` / `pull` commands built on `rsync`
-- a local RPC server so the remote machine can trigger local-only tasks such as macOS-only tests
-- remote binary installation, so the Linux box can run `sshpal` without needing Cargo, Git, or package downloads
+- a local RPC server so the remote machine can trigger local-only tasks such as macOS-only tests through an installed `sshpal-run` helper
 
 ## What It Does
 
@@ -24,23 +23,21 @@ it syncs the matching subpath from local to remote. `pull` does the inverse.
 
 ### Local-only task execution from the remote machine
 
-You can run a local daemon with:
+Run the local daemon with:
 
 ```sh
 sshpal serve
 ```
 
-Then, from the remote machine, run:
+On startup, `sshpal serve` installs or refreshes the remote `sshpal-run` script at `remote_bin_path`, then starts the reverse tunnel and local RPC server.
+
+From the remote machine, run:
 
 ```sh
-sshpal other-run test
+sshpal-run test
 ```
 
-The remote `sshpal` client sends a request to the local daemon and streams the task's stdout, stderr, and exit code back to the remote terminal.
-
-### Remote installation
-
-`sshpal install-remote` builds a Linux binary locally and copies it to the remote machine so the remote host can use `sshpal` without installing Rust tooling.
+The helper script posts to the local daemon through the reverse tunnel and streams stdout, stderr, and exit code back to the remote terminal.
 
 ## Configuration
 
@@ -56,7 +53,6 @@ Place it at the project root. `sshpal` will walk upward from your current direct
 
 - `ssh_target`
 - `remote_root`
-- `remote_arch`
 
 ### Optional fields
 
@@ -65,7 +61,7 @@ Place it at the project root. `sshpal` will walk upward from your current direct
 - `rpc_port`
   - default: `45678`
 - `remote_bin_path`
-  - default: `"~/.local/bin/sshpal"`
+  - default: `"~/.local/bin/sshpal-run"`
 - `tasks`
   - default: empty
 
@@ -101,35 +97,12 @@ sshpal pull src
 
 ### `sshpal serve`
 
-Starts the local RPC daemon on `127.0.0.1:<rpc_port>` and spawns the reverse SSH tunnel used by the remote client.
+Installs the remote `sshpal-run` helper, starts the local RPC daemon on `127.0.0.1:<rpc_port>`, and spawns the reverse SSH tunnel used by the remote helper.
 
 If the port is already in use, `sshpal` fails with guidance to:
 
 - shut down existing `sshpal` servers
 - or choose another port with `rpc_port` in config
-
-### `sshpal other-run <task> [args...]`
-
-Runs a configured local task through the RPC daemon and prints the task output on the remote terminal.
-
-Only named tasks from config are allowed.
-
-Example:
-
-```sh
-sshpal other-run test
-sshpal other-run lint path/to/file
-```
-
-### `sshpal install-remote`
-
-Builds a Linux binary locally and copies it to the remote machine.
-
-Optional override:
-
-```sh
-sshpal install-remote --remote-arch aarch64
-```
 
 ## Example Workflow
 
@@ -140,23 +113,12 @@ Create `.sshpal.toml` in your project root:
 ```toml
 ssh_target = "you@remote-host"
 remote_root = "/work/project"
-remote_arch = "x86_64"
 
 [tasks]
 test = ["bin/test"]
 ```
 
-### 2. Install the remote binary
-
-From the local machine:
-
-```sh
-sshpal install-remote
-```
-
-This copies the Linux binary to the remote machine, defaulting to `~/.local/bin/sshpal`.
-
-### 3. Start the local daemon
+### 2. Start the local daemon
 
 On the local machine:
 
@@ -164,15 +126,17 @@ On the local machine:
 sshpal serve
 ```
 
-### 4. Run tasks from the remote machine
+This installs the remote helper to `~/.local/bin/sshpal-run` by default.
+
+### 3. Run tasks from the remote machine
 
 On the remote machine:
 
 ```sh
-sshpal other-run test
+sshpal-run test
 ```
 
-### 5. Sync files in either direction
+### 4. Sync files in either direction
 
 From any directory inside the local project:
 
@@ -181,18 +145,17 @@ sshpal push .
 sshpal pull .
 ```
 
-## Build Requirements
+## Runtime Requirements
 
-For normal local development:
+For local development:
 
 - Rust toolchain
 
-For `install-remote`:
+For the remote helper:
 
-- a local Zig toolchain
-- `cargo-zigbuild`
-
-`sshpal install-remote` expects to build a static Linux binary locally. The remote machine does not need Rust, Cargo, Git, or internet access.
+- `/bin/sh`
+- `curl`
+- `jq`
 
 ## Testing
 
@@ -202,13 +165,13 @@ Run the standard test suite with:
 cargo test
 ```
 
-There is also an ignored Docker-based integration test that exercises the Linux remote client behavior:
+There is also an ignored Docker-based integration test that exercises the `sshpal-run` remote helper behavior:
 
 ```sh
 cargo test --test docker_remote -- --ignored --nocapture
 ```
 
-That test requires Docker, network access for image/package pulls, and extra time to build the Linux binary in-container.
+That test requires Docker, network access for image/package pulls, and extra time to install packages in-container.
 
 ## Coverage
 

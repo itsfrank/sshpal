@@ -7,7 +7,12 @@ fn binary_help_succeeds() {
     cmd.arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Sync files and proxy local-only tasks through SSH"));
+        .stdout(predicate::str::contains(
+            "Sync files and proxy local-only tasks through SSH",
+        ))
+        .stdout(predicate::str::contains("serve"))
+        .stdout(predicate::str::contains("other-run").not())
+        .stdout(predicate::str::contains("install-remote").not());
 }
 
 #[test]

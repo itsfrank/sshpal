@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, RemoteArch};
+use crate::config::Config;
 use crate::paths::{SyncDirection, SyncPlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +17,11 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     pub fn new(program: impl Into<OsString>) -> Self {
-        Self { program: program.into(), args: Vec::new(), cwd: None }
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: None,
+        }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
@@ -69,7 +73,10 @@ impl CommandRunner for SystemRunner {
 }
 
 fn format_exit_status(status: ExitStatus) -> String {
-    status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+    status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string())
 }
 
 pub type SharedRunner = Arc<dyn CommandRunner>;
@@ -101,20 +108,8 @@ pub fn reverse_tunnel_command(config: &Config) -> CommandSpec {
     CommandSpec::new("ssh").args([
         OsString::from("-N"),
         OsString::from("-R"),
-        OsString::from(format!(
-            "{}:127.0.0.1:{}",
-            config.rpc_port, config.rpc_port
-        )),
+        OsString::from(format!("{}:127.0.0.1:{}", config.rpc_port, config.rpc_port)),
         OsString::from(&config.ssh_target),
-    ])
-}
-
-pub fn cargo_zigbuild_command(arch: &RemoteArch) -> CommandSpec {
-    CommandSpec::new("cargo").args([
-        OsString::from("zigbuild"),
-        OsString::from("--release"),
-        OsString::from("--target"),
-        OsString::from(arch.target_triple()),
     ])
 }
 
@@ -131,7 +126,10 @@ pub fn install_prepare_command(config: &Config) -> CommandSpec {
 pub fn install_copy_command(config: &Config, artifact: &OsStr) -> CommandSpec {
     CommandSpec::new("scp").args([
         artifact.to_os_string(),
-        OsString::from(format!("{}:{}.tmp", config.ssh_target, config.remote_bin_path)),
+        OsString::from(format!(
+            "{}:{}.tmp",
+            config.ssh_target, config.remote_bin_path
+        )),
     ])
 }
 
@@ -192,9 +190,8 @@ mod tests {
             ssh_target: "me@example".to_string(),
             local_root: PathBuf::from("/local"),
             remote_root: PathBuf::from("/remote"),
-            remote_arch: RemoteArch::X86_64,
             rpc_port: 12345,
-            remote_bin_path: "~/.local/bin/sshpal".to_string(),
+            remote_bin_path: "~/.local/bin/sshpal-run".to_string(),
             tasks: BTreeMap::new(),
         }
     }
@@ -249,16 +246,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_cargo_zigbuild_command() {
-        let spec = cargo_zigbuild_command(&RemoteArch::Aarch64);
-        assert_eq!(spec.program, OsString::from("cargo"));
-        assert_eq!(
-            spec.args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>(),
-            vec!["zigbuild", "--release", "--target", "aarch64-unknown-linux-musl"]
-        );
-    }
-
-    #[test]
     fn command_spec_builder_sets_args_and_cwd() {
         let spec = CommandSpec::new("echo")
             .arg("hello")
@@ -266,7 +253,10 @@ mod tests {
             .cwd("/tmp");
         assert_eq!(spec.program, OsString::from("echo"));
         assert_eq!(
-            spec.args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            spec.args
+                .iter()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
             vec!["hello", "world"]
         );
         assert_eq!(spec.cwd, Some(PathBuf::from("/tmp")));
@@ -276,7 +266,10 @@ mod tests {
     fn recording_runner_can_fail_on_program() {
         let runner = RecordingRunner::default();
         runner.fail_on("scp");
-        let err = runner.run(&CommandSpec::new("scp")).unwrap_err().to_string();
+        let err = runner
+            .run(&CommandSpec::new("scp"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("forced failure"));
     }
 

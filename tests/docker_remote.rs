@@ -8,13 +8,12 @@ use anyhow::{Context, Result, bail};
 #[ignore = "requires Docker, image pulls, and network access"]
 fn ubuntu_container_remote_client_replays_output_and_exit_code() -> Result<()> {
     ensure_docker()?;
-    build_linux_binary_in_docker()?;
 
     let port = 49091;
     let remote_project = prepare_remote_project_dir(port)?;
     write_remote_config(&remote_project, port)?;
 
-    let output = run_remote_container(&remote_project, port)?;
+    let output = run_remote_container(&remote_project)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -45,33 +44,6 @@ fn ensure_docker() -> Result<()> {
     Ok(())
 }
 
-fn build_linux_binary_in_docker() -> Result<()> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let status = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{}:/work", workspace.display()),
-            "-w",
-            "/work",
-            "-e",
-            "CARGO_TARGET_DIR=/work/target/docker-linux",
-            "rust:1.88-bookworm",
-            "cargo",
-            "build",
-            "--release",
-            "--bin",
-            "sshpal",
-        ])
-        .status()
-        .context("failed to build Linux binary in Docker")?;
-    if !status.success() {
-        bail!("dockerized Linux build failed with status {:?}", status.code());
-    }
-    Ok(())
-}
-
 fn prepare_remote_project_dir(port: u16) -> Result<PathBuf> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -86,7 +58,6 @@ fn write_remote_config(dir: &Path, port: u16) -> Result<()> {
         r#"
 ssh_target = "container@example"
 remote_root = "/workspace/project"
-remote_arch = "x86_64"
 rpc_port = {port}
 
 [tasks]
@@ -94,7 +65,13 @@ test = ["placeholder"]
 "#
     );
     fs::write(dir.join(".sshpal.toml"), content).context("failed to write remote test config")?;
-    fs::write(dir.join("rpc_stub.py"), rpc_stub_script(port)).context("failed to write rpc stub")?;
+    fs::write(dir.join("rpc_stub.py"), rpc_stub_script(port))
+        .context("failed to write rpc stub")?;
+    fs::write(
+        dir.join("sshpal-run"),
+        sshpal::rpc::remote_helper_script(port),
+    )
+    .context("failed to write sshpal-run helper")?;
     Ok(())
 }
 
@@ -139,14 +116,12 @@ HTTPServer(('127.0.0.1', PORT), Handler).serve_forever()
     )
 }
 
-fn run_remote_container(project_dir: &Path, _port: u16) -> Result<std::process::Output> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let remote_script = format!(
-        "set -euo pipefail; \
+fn run_remote_container(project_dir: &Path) -> Result<std::process::Output> {
+    let remote_script = "set -euo pipefail; \
          apt-get update >/dev/null; \
-         apt-get install -y python3 >/dev/null; \
-         cp /work/target/docker-linux/release/sshpal /usr/local/bin/sshpal; \
-         chmod +x /usr/local/bin/sshpal; \
+         apt-get install -y curl jq python3 >/dev/null; \
+         cp /project/sshpal-run /usr/local/bin/sshpal-run; \
+         chmod +x /usr/local/bin/sshpal-run; \
          python3 /project/rpc_stub.py >/tmp/rpc_stub.log 2>&1 & \
          stub_pid=$!; \
          trap 'kill $stub_pid 2>/dev/null || true' EXIT; \
@@ -156,21 +131,18 @@ fn run_remote_container(project_dir: &Path, _port: u16) -> Result<std::process::
              exit 1; \
          fi; \
          cd /project; \
-         sshpal other-run test; \
+         sshpal-run test; \
          status=$?; \
          if [ $status -ne 0 ]; then \
              echo '--- rpc stub log ---' >&2; \
              cat /tmp/rpc_stub.log >&2 || true; \
              exit $status; \
-         fi"
-    );
+         fi";
 
     Command::new("docker")
         .args([
             "run",
             "--rm",
-            "-v",
-            &format!("{}:/work", workspace.display()),
             "-v",
             &format!("{}:/project", project_dir.display()),
             "-w",
@@ -178,7 +150,7 @@ fn run_remote_container(project_dir: &Path, _port: u16) -> Result<std::process::
             "ubuntu:24.04",
             "bash",
             "-lc",
-            &remote_script,
+            remote_script,
         ])
         .output()
         .context("failed to run Ubuntu remote container")

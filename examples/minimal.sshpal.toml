@@ -1,6 +1,5 @@
 ssh_target = "you@remote-host"
 remote_root = "/work/project"
-remote_arch = "x86_64"
 
 [tasks]
 test = ["bin/test"]

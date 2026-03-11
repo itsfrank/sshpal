@@ -11,8 +11,6 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use futures_util::StreamExt;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::TcpListener;
@@ -36,13 +34,19 @@ pub enum RpcEvent {
     Exit { code: i32 },
 }
 
+pub fn remote_helper_script(port: u16) -> String {
+    include_str!("sshpal-run.sh").replace("__SSHPAL_RPC_PORT__", &port.to_string())
+}
+
 #[derive(Clone)]
 struct RpcState {
     tasks: BTreeMap<String, Vec<String>>,
 }
 
 pub async fn serve(config: Config) -> Result<()> {
-    let state = RpcState { tasks: config.tasks };
+    let state = RpcState {
+        tasks: config.tasks,
+    };
     let app = Router::new()
         .route("/run", post(run_task))
         .with_state(state);
@@ -71,17 +75,17 @@ async fn run_task(
     State(state): State<RpcState>,
     Json(request): Json<RpcRequest>,
 ) -> Result<Response, RpcResponseError> {
-    let base = state
-        .tasks
-        .get(&request.task)
-        .cloned()
-        .ok_or_else(|| RpcResponseError::new(StatusCode::NOT_FOUND, format!("unknown task `{}`", request.task)))?;
+    let base = state.tasks.get(&request.task).cloned().ok_or_else(|| {
+        RpcResponseError::new(
+            StatusCode::NOT_FOUND,
+            format!("unknown task `{}`", request.task),
+        )
+    })?;
     let mut argv = base;
     argv.extend(request.args);
-    let program = argv
-        .first()
-        .cloned()
-        .ok_or_else(|| RpcResponseError::new(StatusCode::BAD_REQUEST, "task command is empty".to_string()))?;
+    let program = argv.first().cloned().ok_or_else(|| {
+        RpcResponseError::new(StatusCode::BAD_REQUEST, "task command is empty".to_string())
+    })?;
     let args = argv.into_iter().skip(1).collect::<Vec<_>>();
 
     let mut child = Command::new(program)
@@ -92,10 +96,16 @@ async fn run_task(
         .map_err(|err| RpcResponseError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     let stdout = child.stdout.take().ok_or_else(|| {
-        RpcResponseError::new(StatusCode::INTERNAL_SERVER_ERROR, "missing child stdout".to_string())
+        RpcResponseError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing child stdout".to_string(),
+        )
     })?;
     let stderr = child.stderr.take().ok_or_else(|| {
-        RpcResponseError::new(StatusCode::INTERNAL_SERVER_ERROR, "missing child stderr".to_string())
+        RpcResponseError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing child stderr".to_string(),
+        )
     })?;
 
     let body_stream = stream! {
@@ -143,11 +153,17 @@ async fn pump_reader<R>(
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let event = if stdout {
-            RpcEvent::Stdout { chunk: format!("{line}\n") }
+            RpcEvent::Stdout {
+                chunk: format!("{line}\n"),
+            }
         } else {
-            RpcEvent::Stderr { chunk: format!("{line}\n") }
+            RpcEvent::Stderr {
+                chunk: format!("{line}\n"),
+            }
         };
-        let serialized = serde_json::to_string(&event).map(|s| format!("{s}\n")).map_err(|e| anyhow!(e));
+        let serialized = serde_json::to_string(&event)
+            .map(|s| format!("{s}\n"))
+            .map_err(|e| anyhow!(e));
         let _ = tx.send(serialized);
     }
 }
@@ -170,54 +186,12 @@ impl IntoResponse for RpcResponseError {
     }
 }
 
-pub async fn other_run(config: &Config, task: String, args: Vec<String>) -> Result<i32> {
-    let url = format!("http://127.0.0.1:{}/run", config.rpc_port);
-    let client = Client::builder().build()?;
-    let response = client
-        .post(url)
-        .json(&RpcRequest { task, args })
-        .send()
-        .await
-        .context("failed to contact local RPC daemon")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        bail!("RPC request failed: {status} {text}");
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut carry = Vec::<u8>::new();
-    let mut exit_code = None;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        carry.extend_from_slice(&chunk);
-        while let Some(pos) = carry.iter().position(|b| *b == b'\n') {
-            let line = carry.drain(..=pos).collect::<Vec<_>>();
-            if line.len() <= 1 {
-                continue;
-            }
-            let event: RpcEvent = serde_json::from_slice(&line[..line.len() - 1])?;
-            match event {
-                RpcEvent::Stdout { chunk } => {
-                    print!("{chunk}");
-                }
-                RpcEvent::Stderr { chunk } => {
-                    eprint!("{chunk}");
-                }
-                RpcEvent::Exit { code } => {
-                    exit_code = Some(code);
-                }
-            }
-        }
-    }
-    exit_code.ok_or_else(|| anyhow!("RPC stream ended without exit event"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, RemoteArch};
+    use crate::config::Config;
+    use futures_util::StreamExt;
+    use reqwest::Client;
     use std::net::TcpListener as StdTcpListener;
     use tokio::time::{Duration, sleep};
 
@@ -225,7 +199,11 @@ mod tests {
         let mut tasks = BTreeMap::new();
         tasks.insert(
             "test".to_string(),
-            vec!["sh".to_string(), "-c".to_string(), "echo out; echo err >&2; exit 7".to_string()],
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo out; echo err >&2; exit 7".to_string(),
+            ],
         );
         tasks.insert(
             "slow".to_string(),
@@ -239,31 +217,84 @@ mod tests {
             ssh_target: "me@example".to_string(),
             local_root: "/tmp/local".into(),
             remote_root: "/tmp/remote".into(),
-            remote_arch: RemoteArch::X86_64,
             rpc_port: port,
-            remote_bin_path: "~/.local/bin/sshpal".to_string(),
+            remote_bin_path: "~/.local/bin/sshpal-run".to_string(),
             tasks,
         }
     }
 
+    async fn collect_events(
+        config: &Config,
+        task: &str,
+        args: Vec<String>,
+    ) -> Result<Vec<RpcEvent>> {
+        let url = format!("http://127.0.0.1:{}/run", config.rpc_port);
+        let response = Client::builder()
+            .build()?
+            .post(url)
+            .json(&RpcRequest {
+                task: task.to_string(),
+                args,
+            })
+            .send()
+            .await
+            .context("failed to contact local RPC daemon")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            bail!("RPC request failed: {status} {text}");
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut carry = Vec::<u8>::new();
+        let mut events = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            carry.extend_from_slice(&chunk);
+            while let Some(pos) = carry.iter().position(|b| *b == b'\n') {
+                let line = carry.drain(..=pos).collect::<Vec<_>>();
+                if line.len() <= 1 {
+                    continue;
+                }
+                events.push(serde_json::from_slice(&line[..line.len() - 1])?);
+            }
+        }
+        Ok(events)
+    }
+
     #[tokio::test]
     async fn rpc_serializes() {
-        let req = RpcRequest { task: "test".to_string(), args: vec!["a".to_string()] };
+        let req = RpcRequest {
+            task: "test".to_string(),
+            args: vec!["a".to_string()],
+        };
         let json = serde_json::to_string(&req).unwrap();
         let roundtrip: RpcRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, req);
     }
 
     #[tokio::test]
-    async fn other_run_returns_exit_code() {
+    async fn run_endpoint_streams_stdout_stderr_and_exit() {
         let port = 49001;
         let cfg = config_for(port);
         let server_cfg = cfg.clone();
         let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
         sleep(Duration::from_millis(100)).await;
-        let code = other_run(&cfg, "test".to_string(), Vec::new()).await.unwrap();
+        let events = collect_events(&cfg, "test", Vec::new()).await.unwrap();
         handle.abort();
-        assert_eq!(code, 7);
+        assert_eq!(
+            events,
+            vec![
+                RpcEvent::Stdout {
+                    chunk: "out\n".to_string()
+                },
+                RpcEvent::Stderr {
+                    chunk: "err\n".to_string()
+                },
+                RpcEvent::Exit { code: 7 },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -273,9 +304,19 @@ mod tests {
         let server_cfg = cfg.clone();
         let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
         sleep(Duration::from_millis(100)).await;
-        let err = other_run(&cfg, "missing".to_string(), Vec::new()).await.unwrap_err();
+        let err = collect_events(&cfg, "missing", Vec::new())
+            .await
+            .unwrap_err();
         handle.abort();
         assert!(err.to_string().contains("RPC request failed"));
+    }
+
+    #[test]
+    fn remote_helper_script_embeds_port_and_command_name() {
+        let script = remote_helper_script(45678);
+        assert!(script.starts_with("#!/bin/sh"));
+        assert!(script.contains("usage: sshpal-run <task> [args...]"));
+        assert!(script.contains("http://127.0.0.1:45678/run"));
     }
 
     #[tokio::test]

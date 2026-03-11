@@ -1,9 +1,8 @@
 ssh_target = "you@remote-host"
 local_root = "/tmp/local-worktree" # optional (default: directory containing this config file)
 remote_root = "/work/project"
-remote_arch = "aarch64"
 rpc_port = 40001 # optional (default: 45678)
-remote_bin_path = "~/bin/sshpal-custom" # optional (default: ~/.local/bin/sshpal)
+remote_bin_path = "~/bin/sshpal-run-custom" # optional (default: ~/.local/bin/sshpal-run)
 
 [tasks]
 test = ["bin/test"]
