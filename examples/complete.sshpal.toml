@@ -7,3 +7,4 @@ remote_bin_path = "~/bin/sshpal-run-custom" # optional (default: ~/.local/bin/ss
 [tasks]
 test = ["bin/test"]
 lint = ["bin/lint", "--format", "json", "--strict"]
+check = [["cargo", "fmt", "--check"], ["cargo", "test"]]

@@ -116,6 +116,7 @@ remote_root = "/work/project"
 
 [tasks]
 test = ["bin/test"]
+check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
 ```
 
 ### 2. Start the local daemon
@@ -135,6 +136,8 @@ On the remote machine:
 ```sh
 sshpal-run test
 ```
+
+Tasks can be defined as either a single command array or a sequence of command arrays. For sequential tasks, commands run in order and stop on the first non-zero exit code. Any extra args passed to `sshpal-run <task> ...` are appended to the final command in the sequence.
 
 ### 4. Sync files in either direction
 

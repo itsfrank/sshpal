@@ -9,17 +9,14 @@ pub const CONFIG_FILE_NAME: &str = ".sshpal.toml";
 pub const DEFAULT_RPC_PORT: u16 = 45_678;
 pub const DEFAULT_REMOTE_BIN_PATH: &str = "~/.local/bin/sshpal-run";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub ssh_target: String,
     pub local_root: PathBuf,
     pub remote_root: PathBuf,
-    #[serde(default = "default_rpc_port")]
     pub rpc_port: u16,
-    #[serde(default = "default_remote_bin_path")]
     pub remote_bin_path: String,
-    #[serde(default)]
-    pub tasks: BTreeMap<String, Vec<String>>,
+    pub tasks: BTreeMap<String, Task>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -32,7 +29,19 @@ struct RawConfig {
     #[serde(default = "default_remote_bin_path")]
     remote_bin_path: String,
     #[serde(default)]
-    tasks: BTreeMap<String, Vec<String>>,
+    tasks: BTreeMap<String, RawTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    pub steps: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum RawTask {
+    Command(Vec<String>),
+    Sequence(Vec<Vec<String>>),
 }
 
 #[derive(Debug, Clone)]
@@ -64,12 +73,17 @@ impl Config {
         if self.remote_bin_path.trim().is_empty() {
             bail!("config remote_bin_path must not be empty");
         }
-        for (task, argv) in &self.tasks {
+        for (task, task_def) in &self.tasks {
             if task.trim().is_empty() {
                 bail!("config task names must not be empty");
             }
-            if argv.is_empty() || argv[0].trim().is_empty() {
-                bail!("config task `{task}` must define a non-empty command array");
+            if task_def.steps.is_empty() {
+                bail!("config task `{task}` must define at least one command");
+            }
+            for argv in &task_def.steps {
+                if argv.is_empty() || argv[0].trim().is_empty() {
+                    bail!("config task `{task}` must define non-empty command arrays");
+                }
             }
         }
         Ok(())
@@ -86,7 +100,20 @@ impl RawConfig {
             remote_root: self.remote_root,
             rpc_port: self.rpc_port,
             remote_bin_path: self.remote_bin_path,
-            tasks: self.tasks,
+            tasks: self
+                .tasks
+                .into_iter()
+                .map(|(name, task)| (name, task.resolve()))
+                .collect(),
+        }
+    }
+}
+
+impl RawTask {
+    fn resolve(self) -> Task {
+        match self {
+            Self::Command(argv) => Task { steps: vec![argv] },
+            Self::Sequence(steps) => Task { steps },
         }
     }
 }
@@ -188,6 +215,12 @@ test = ["cargo", "test"]
         assert!(config.tasks.contains_key("test"));
         assert_eq!(config.rpc_port, DEFAULT_RPC_PORT);
         assert_eq!(config.remote_bin_path, DEFAULT_REMOTE_BIN_PATH);
+        assert_eq!(
+            config.tasks.get("test").unwrap(),
+            &Task {
+                steps: vec![vec!["bin/test".to_string()]]
+            }
+        );
     }
 
     #[test]
@@ -203,12 +236,44 @@ test = ["cargo", "test"]
         assert_eq!(config.remote_bin_path, "~/bin/sshpal-run-custom");
         assert_eq!(
             config.tasks.get("lint").unwrap(),
-            &vec![
-                "bin/lint".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--strict".to_string()
-            ]
+            &Task {
+                steps: vec![vec![
+                    "bin/lint".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                    "--strict".to_string()
+                ]]
+            }
+        );
+    }
+
+    #[test]
+    fn parses_sequential_task_steps() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks]
+check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
+"#,
+        )
+        .unwrap();
+
+        let config = raw.resolve(Path::new("/tmp/example-project"));
+        config.validate().unwrap();
+        assert_eq!(
+            config.tasks.get("check").unwrap(),
+            &Task {
+                steps: vec![
+                    vec![
+                        "cargo".to_string(),
+                        "fmt".to_string(),
+                        "--check".to_string()
+                    ],
+                    vec!["cargo".to_string(), "test".to_string()]
+                ]
+            }
         );
     }
 }

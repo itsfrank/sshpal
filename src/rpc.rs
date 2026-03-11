@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::config::Config;
+use crate::config::{Config, Task};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcRequest {
@@ -40,7 +40,7 @@ pub fn remote_helper_script(port: u16) -> String {
 
 #[derive(Clone)]
 struct RpcState {
-    tasks: BTreeMap<String, Vec<String>>,
+    tasks: BTreeMap<String, Task>,
 }
 
 pub async fn serve(config: Config) -> Result<()> {
@@ -82,63 +82,104 @@ async fn run_task(
         request.task,
         format_invocation_args(&request.args)
     );
-    let base = state.tasks.get(&request.task).cloned().ok_or_else(|| {
+    let task = state.tasks.get(&request.task).cloned().ok_or_else(|| {
         RpcResponseError::new(
             StatusCode::NOT_FOUND,
             format!("unknown task `{}`", request.task),
         )
     })?;
-    let mut argv = base;
-    argv.extend(request.args);
-    let program = argv.first().cloned().ok_or_else(|| {
-        RpcResponseError::new(StatusCode::BAD_REQUEST, "task command is empty".to_string())
-    })?;
-    let args = argv.into_iter().skip(1).collect::<Vec<_>>();
-
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| RpcResponseError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    let stdout = child.stdout.take().ok_or_else(|| {
-        RpcResponseError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "missing child stdout".to_string(),
-        )
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        RpcResponseError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "missing child stderr".to_string(),
-        )
-    })?;
 
     let body_stream = stream! {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Result<String, anyhow::Error>>();
-        tokio::spawn(pump_reader(stdout, tx.clone(), true));
-        tokio::spawn(pump_reader(stderr, tx, false));
+        let mut exit_code = 0;
 
-        while let Some(item) = rx.recv().await {
-            match item {
-                Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
+        for (index, step) in task.steps.iter().enumerate() {
+            let argv = augment_step(step.clone(), &request.args, index + 1 == task.steps.len());
+            eprintln!(
+                "sshpal: starting step {}/{} for `{}`: {}",
+                index + 1,
+                task.steps.len(),
+                request.task,
+                format_step(&argv)
+            );
+
+            let Some(program) = argv.first().cloned() else {
+                let event = serde_json::to_string(&RpcEvent::Stderr {
+                    chunk: "task command is empty\n".to_string(),
+                }).unwrap();
+                yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
+                exit_code = 1;
+                break;
+            };
+            let args = argv.into_iter().skip(1).collect::<Vec<_>>();
+
+            let mut child = match Command::new(program)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn() {
+                Ok(child) => child,
                 Err(err) => {
-                    let event = serde_json::to_string(&RpcEvent::Stderr { chunk: format!("stream error: {err}\n") }).unwrap();
+                    let event = serde_json::to_string(&RpcEvent::Stderr {
+                        chunk: format!("{err}\n"),
+                    }).unwrap();
                     yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
+                    exit_code = 1;
+                    break;
                 }
+            };
+
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    let event = serde_json::to_string(&RpcEvent::Stderr {
+                        chunk: "missing child stdout\n".to_string(),
+                    }).unwrap();
+                    yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
+                    exit_code = 1;
+                    break;
+                }
+            };
+            let stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    let event = serde_json::to_string(&RpcEvent::Stderr {
+                        chunk: "missing child stderr\n".to_string(),
+                    }).unwrap();
+                    yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
+                    exit_code = 1;
+                    break;
+                }
+            };
+
+            let (tx, mut rx) = mpsc::unbounded_channel::<Result<String, anyhow::Error>>();
+            tokio::spawn(pump_reader(stdout, tx.clone(), true));
+            tokio::spawn(pump_reader(stderr, tx, false));
+
+            while let Some(item) = rx.recv().await {
+                match item {
+                    Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
+                    Err(err) => {
+                        let event = serde_json::to_string(&RpcEvent::Stderr { chunk: format!("stream error: {err}\n") }).unwrap();
+                        yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
+                    }
+                }
+            }
+
+            let code = match child.wait().await {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(err) => {
+                    let event = serde_json::to_string(&RpcEvent::Stderr { chunk: format!("wait error: {err}\n") }).unwrap();
+                    yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
+                    1
+                }
+            };
+            exit_code = code;
+            if code != 0 {
+                break;
             }
         }
 
-        let code = match child.wait().await {
-            Ok(status) => status.code().unwrap_or(1),
-            Err(err) => {
-                let event = serde_json::to_string(&RpcEvent::Stderr { chunk: format!("wait error: {err}\n") }).unwrap();
-                yield Ok::<_, std::convert::Infallible>(format!("{event}\n"));
-                1
-            }
-        };
-        let exit = serde_json::to_string(&RpcEvent::Exit { code }).unwrap();
+        let exit = serde_json::to_string(&RpcEvent::Exit { code: exit_code }).unwrap();
         yield Ok::<_, std::convert::Infallible>(format!("{exit}\n"));
     };
 
@@ -156,6 +197,17 @@ fn format_invocation_args(args: &[String]) -> String {
     } else {
         format!(" with args [{}]", args.join(", "))
     }
+}
+
+fn augment_step(mut step: Vec<String>, args: &[String], is_final_step: bool) -> Vec<String> {
+    if is_final_step {
+        step.extend(args.iter().cloned());
+    }
+    step
+}
+
+fn format_step(argv: &[String]) -> String {
+    argv.join(" ")
 }
 
 async fn pump_reader<R>(
@@ -214,27 +266,72 @@ mod tests {
         let mut tasks = BTreeMap::new();
         tasks.insert(
             "test".to_string(),
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo out; echo err >&2; exit 7".to_string(),
-            ],
+            Task {
+                steps: vec![vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo out; echo err >&2; exit 7".to_string(),
+                ]],
+            },
         );
         tasks.insert(
             "slow".to_string(),
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo first; sleep 0.2; echo second; exit 0".to_string(),
-            ],
+            Task {
+                steps: vec![vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo first; sleep 0.2; echo second; exit 0".to_string(),
+                ]],
+            },
         );
         tasks.insert(
             "no_newline".to_string(),
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "printf out".to_string(),
-            ],
+            Task {
+                steps: vec![vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf out".to_string(),
+                ]],
+            },
+        );
+        tasks.insert(
+            "sequence".to_string(),
+            Task {
+                steps: vec![
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo first".to_string(),
+                    ],
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo second \"$0\"; exit 0".to_string(),
+                    ],
+                ],
+            },
+        );
+        tasks.insert(
+            "sequence_fails".to_string(),
+            Task {
+                steps: vec![
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo before-fail".to_string(),
+                    ],
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo boom >&2; exit 9".to_string(),
+                    ],
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo after-fail".to_string(),
+                    ],
+                ],
+            },
         );
         Config {
             ssh_target: "me@example".to_string(),
@@ -332,6 +429,56 @@ mod tests {
             .unwrap_err();
         handle.abort();
         assert!(err.to_string().contains("RPC request failed"));
+    }
+
+    #[tokio::test]
+    async fn run_endpoint_executes_task_steps_sequentially() {
+        let port = 49003;
+        let cfg = config_for(port);
+        let server_cfg = cfg.clone();
+        let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
+        sleep(Duration::from_millis(100)).await;
+        let events = collect_events(&cfg, "sequence", vec!["arg".to_string()])
+            .await
+            .unwrap();
+        handle.abort();
+        assert_eq!(
+            events,
+            vec![
+                RpcEvent::Stdout {
+                    chunk: "first\n".to_string()
+                },
+                RpcEvent::Stdout {
+                    chunk: "second arg\n".to_string()
+                },
+                RpcEvent::Exit { code: 0 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_endpoint_stops_on_first_failing_step() {
+        let port = 49004;
+        let cfg = config_for(port);
+        let server_cfg = cfg.clone();
+        let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
+        sleep(Duration::from_millis(100)).await;
+        let events = collect_events(&cfg, "sequence_fails", Vec::new())
+            .await
+            .unwrap();
+        handle.abort();
+        assert_eq!(
+            events,
+            vec![
+                RpcEvent::Stdout {
+                    chunk: "before-fail\n".to_string()
+                },
+                RpcEvent::Stderr {
+                    chunk: "boom\n".to_string()
+                },
+                RpcEvent::Exit { code: 9 },
+            ]
+        );
     }
 
     #[test]
