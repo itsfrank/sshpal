@@ -86,11 +86,15 @@ pub fn rsync_command(config: &Config, plan: &SyncPlan) -> CommandSpec {
     let dest;
     match plan.direction {
         SyncDirection::Push => {
-            source = plan.local_path.as_os_str().to_os_string();
+            source = rsync_source_path(&plan.local_path, plan.source_is_dir);
             dest = format!("{}:{}", config.ssh_target, plan.remote_path.display()).into();
         }
         SyncDirection::Pull => {
-            source = format!("{}:{}", config.ssh_target, plan.remote_path.display()).into();
+            source = rsync_remote_source(
+                &config.ssh_target,
+                &plan.remote_path,
+                plan.source_is_dir,
+            );
             dest = plan.local_path.as_os_str().to_os_string();
         }
     }
@@ -102,6 +106,22 @@ pub fn rsync_command(config: &Config, plan: &SyncPlan) -> CommandSpec {
         source,
         dest,
     ])
+}
+
+fn rsync_source_path(path: &std::path::Path, is_dir: bool) -> OsString {
+    let mut value = path.as_os_str().to_os_string();
+    if is_dir {
+        value.push("/");
+    }
+    value
+}
+
+fn rsync_remote_source(target: &str, path: &std::path::Path, is_dir: bool) -> OsString {
+    let mut value = format!("{target}:{}", path.display());
+    if is_dir {
+        value.push('/');
+    }
+    value.into()
 }
 
 pub fn reverse_tunnel_command(config: &Config) -> CommandSpec {
@@ -205,10 +225,12 @@ mod tests {
                 relative_path: PathBuf::from("foo"),
                 local_path: PathBuf::from("/local/foo"),
                 remote_path: PathBuf::from("/remote/foo"),
+                source_is_dir: true,
             },
         );
         assert_eq!(spec.program, OsString::from("rsync"));
         assert!(spec.args.iter().any(|a| a == "--delete"));
+        assert_eq!(spec.args[4].to_string_lossy(), "/local/foo/");
     }
 
     #[test]
@@ -220,10 +242,11 @@ mod tests {
                 relative_path: PathBuf::from("foo"),
                 local_path: PathBuf::from("/local/foo"),
                 remote_path: PathBuf::from("/remote/foo"),
+                source_is_dir: true,
             },
         );
         assert_eq!(spec.program, OsString::from("rsync"));
-        assert_eq!(spec.args[4].to_string_lossy(), "me@example:/remote/foo");
+        assert_eq!(spec.args[4].to_string_lossy(), "me@example:/remote/foo/");
         assert_eq!(spec.args[5].to_string_lossy(), "/local/foo");
     }
 

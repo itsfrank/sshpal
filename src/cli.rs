@@ -150,6 +150,7 @@ remote_root = "/remote/proj"
         run_with(cli, runner.clone()).await.unwrap();
         let specs = runner.take();
         assert_eq!(specs[0].program.to_string_lossy(), "rsync");
+        assert!(specs[0].args[4].to_string_lossy().ends_with("/proj/a/b/"));
     }
 
     #[tokio::test]
@@ -169,7 +170,7 @@ remote_root = "/remote/proj"
         assert!(
             specs[0].args[4]
                 .to_string_lossy()
-                .contains("me@example:/remote/proj/a/b")
+                .contains("me@example:/remote/proj/a/b/")
         );
     }
 

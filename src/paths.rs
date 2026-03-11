@@ -14,6 +14,7 @@ pub struct SyncPlan {
     pub relative_path: PathBuf,
     pub local_path: PathBuf,
     pub remote_path: PathBuf,
+    pub source_is_dir: bool,
 }
 
 pub fn relative_cwd(local_root: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -62,11 +63,13 @@ pub fn build_sync_plan(
     direction: SyncDirection,
 ) -> Result<SyncPlan> {
     let relative_path = resolve_relative_target(cwd_rel, arg)?;
+    let local_path = local_root.join(&relative_path);
     Ok(SyncPlan {
         direction,
-        local_path: local_root.join(&relative_path),
+        local_path: local_path.clone(),
         remote_path: remote_root.join(&relative_path),
         relative_path,
+        source_is_dir: local_path.is_dir(),
     })
 }
 
@@ -115,5 +118,25 @@ mod tests {
         .unwrap();
         assert_eq!(plan.local_path, PathBuf::from("/local/foo/bar"));
         assert_eq!(plan.remote_path, PathBuf::from("/remote/foo/bar"));
+        assert!(!plan.source_is_dir);
+    }
+
+    #[test]
+    fn marks_existing_directory_as_dir_source() {
+        let dir = tempdir().unwrap();
+        let local_root = dir.path().join("local");
+        let remote_root = dir.path().join("remote");
+        fs::create_dir_all(local_root.join("foo/bar")).unwrap();
+
+        let plan = build_sync_plan(
+            &local_root,
+            &remote_root,
+            Path::new("foo"),
+            Path::new("bar"),
+            SyncDirection::Push,
+        )
+        .unwrap();
+
+        assert!(plan.source_is_dir);
     }
 }
