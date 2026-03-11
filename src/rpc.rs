@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::process::Stdio;
 
@@ -47,9 +48,17 @@ pub async fn serve(config: Config) -> Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.rpc_port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind RPC server on {}", addr))?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::AddrInUse => {
+            bail!(
+                "failed to bind RPC server on {addr}: port already in use; shut down existing sshpal servers or use the rpc_port config option"
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to bind RPC server on {}", addr));
+        }
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -209,6 +218,7 @@ pub async fn other_run(config: &Config, task: String, args: Vec<String>) -> Resu
 mod tests {
     use super::*;
     use crate::config::{Config, RemoteArch};
+    use std::net::TcpListener as StdTcpListener;
     use tokio::time::{Duration, sleep};
 
     fn config_for(port: u16) -> Config {
@@ -266,5 +276,15 @@ mod tests {
         let err = other_run(&cfg, "missing".to_string(), Vec::new()).await.unwrap_err();
         handle.abort();
         assert!(err.to_string().contains("RPC request failed"));
+    }
+
+    #[tokio::test]
+    async fn serve_reports_actionable_error_when_port_is_taken() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = serve(config_for(port)).await.unwrap_err().to_string();
+        assert!(err.contains("port already in use"));
+        assert!(err.contains("shut down existing sshpal servers"));
+        assert!(err.contains("rpc_port config option"));
     }
 }

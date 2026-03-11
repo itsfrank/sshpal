@@ -7,7 +7,7 @@ use clap::ValueEnum;
 use serde::Deserialize;
 
 pub const CONFIG_FILE_NAME: &str = ".sshpal.toml";
-pub const DEFAULT_RPC_PORT: u16 = 48_765;
+pub const DEFAULT_RPC_PORT: u16 = 45_678;
 pub const DEFAULT_REMOTE_BIN_PATH: &str = "~/.local/bin/sshpal";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -194,5 +194,39 @@ test = ["cargo", "test"]
         let dir = tempdir().unwrap();
         let err = discover_config(dir.path()).unwrap_err().to_string();
         assert!(err.contains(CONFIG_FILE_NAME));
+    }
+
+    #[test]
+    fn minimal_example_config_stays_valid() {
+        let raw: RawConfig = toml::from_str(include_str!("../examples/minimal.sshpal.toml")).unwrap();
+        let project_root = Path::new("/tmp/example-project");
+        let config = raw.resolve(project_root);
+        config.validate().unwrap();
+        assert_eq!(config.local_root, project_root);
+        assert_eq!(config.remote_root, PathBuf::from("/work/project"));
+        assert!(config.tasks.contains_key("test"));
+        assert_eq!(config.rpc_port, DEFAULT_RPC_PORT);
+        assert_eq!(config.remote_bin_path, DEFAULT_REMOTE_BIN_PATH);
+    }
+
+    #[test]
+    fn complete_example_config_stays_valid() {
+        let raw: RawConfig = toml::from_str(include_str!("../examples/complete.sshpal.toml")).unwrap();
+        let project_root = Path::new("/tmp/example-project");
+        let config = raw.resolve(project_root);
+        config.validate().unwrap();
+        assert_eq!(config.local_root, PathBuf::from("/tmp/local-worktree"));
+        assert_eq!(config.remote_root, PathBuf::from("/work/project"));
+        assert_eq!(config.rpc_port, 40_001);
+        assert_eq!(config.remote_bin_path, "~/bin/sshpal-custom");
+        assert_eq!(
+            config.tasks.get("lint").unwrap(),
+            &vec![
+                "bin/lint".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--strict".to_string()
+            ]
+        );
     }
 }
