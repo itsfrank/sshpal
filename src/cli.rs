@@ -194,7 +194,7 @@ remote_root = "/remote/proj"
         assert!(specs[1].args[0].to_string_lossy().contains("sshpal-run-"));
         assert_eq!(
             specs[1].args[1].to_string_lossy(),
-            "me@example:~/.local/bin/sshpal-run.tmp"
+            "me@example:/tmp/sshpal-run-45678.tmp"
         );
         assert_eq!(specs[2].program.to_string_lossy(), "ssh");
     }

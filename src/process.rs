@@ -134,33 +134,54 @@ pub fn reverse_tunnel_command(config: &Config) -> CommandSpec {
 }
 
 pub fn install_prepare_command(config: &Config) -> CommandSpec {
+    let remote_path = remote_shell_path(&config.remote_bin_path);
     CommandSpec::new("ssh").args([
         OsString::from(&config.ssh_target),
-        OsString::from(format!(
-            "mkdir -p \"$(dirname {})\"",
-            shell_quote(&config.remote_bin_path)
-        )),
+        OsString::from(format!("mkdir -p \"$(dirname {remote_path})\"")),
     ])
 }
 
 pub fn install_copy_command(config: &Config, artifact: &OsStr) -> CommandSpec {
     CommandSpec::new("scp").args([
         artifact.to_os_string(),
-        OsString::from(format!(
-            "{}:{}.tmp",
-            config.ssh_target, config.remote_bin_path
-        )),
+        OsString::from(format!("{}:{}", config.ssh_target, remote_staging_path(config))),
     ])
 }
 
 pub fn install_finalize_command(config: &Config) -> CommandSpec {
+    let remote_path = remote_shell_path(&config.remote_bin_path);
+    let staging_path = shell_quote(&remote_staging_path(config));
     CommandSpec::new("ssh").args([
         OsString::from(&config.ssh_target),
         OsString::from(format!(
-            "chmod +x {path}.tmp && mv {path}.tmp {path}",
-            path = shell_quote(&config.remote_bin_path)
+            "chmod +x {staging_path} && mv {staging_path} {remote_path}",
         )),
     ])
+}
+
+fn remote_staging_path(config: &Config) -> String {
+    format!("/tmp/sshpal-run-{}.tmp", config.rpc_port)
+}
+
+fn remote_shell_path(raw: &str) -> String {
+    match raw.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME/{}\"", escape_double_quoted(rest)),
+        None => shell_quote(raw),
+    }
+}
+
+fn escape_double_quoted(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '"' | '$' | '`' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn shell_quote(raw: &str) -> String {
@@ -266,6 +287,20 @@ mod tests {
         assert_eq!(prep.program, OsString::from("ssh"));
         assert_eq!(copy.program, OsString::from("scp"));
         assert_eq!(fin.program, OsString::from("ssh"));
+        assert_eq!(
+            copy.args[1].to_string_lossy(),
+            "me@example:/tmp/sshpal-run-12345.tmp"
+        );
+        assert!(
+            prep.args[1]
+                .to_string_lossy()
+                .contains("dirname \"$HOME/.local/bin/sshpal-run\"")
+        );
+        assert!(
+            fin.args[1]
+                .to_string_lossy()
+                .contains("mv '/tmp/sshpal-run-12345.tmp' \"$HOME/.local/bin/sshpal-run\"")
+        );
     }
 
     #[test]
