@@ -124,7 +124,6 @@ curl \
 	--silent \
 	--show-error \
 	--no-buffer \
-	--fail-with-body \
 	-H 'Content-Type: application/json' \
 	-d "$payload" \
 	"http://127.0.0.1:__SSHPAL_RPC_PORT__/run" >"$rpc_fifo" &

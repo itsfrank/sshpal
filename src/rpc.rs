@@ -371,7 +371,13 @@ impl RpcResponseError {
 
 impl IntoResponse for RpcResponseError {
     fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
+        // Return JSON event stream format that the shell script's jq parser can handle
+        // Format: stderr event with error message, followed by exit event
+        let error_chunk = BASE64.encode(format!("sshpal: {}\n", self.message));
+        let body = format!(
+            "{{\"type\":\"stderr\",\"chunk_b64\":\"{error_chunk}\"}}\n{{\"type\":\"exit\",\"code\":1}}"
+        );
+        (self.status, body).into_response()
     }
 }
 
