@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -8,6 +9,7 @@ use serde::Deserialize;
 pub const CONFIG_FILE_NAME: &str = ".sshpal.toml";
 pub const DEFAULT_RPC_PORT: u16 = 45_678;
 pub const DEFAULT_REMOTE_BIN_PATH: &str = "~/.local/bin/sshpal-run";
+pub const DEFAULT_SYNC_DETECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -16,6 +18,7 @@ pub struct Config {
     pub remote_root: PathBuf,
     pub rpc_port: u16,
     pub remote_bin_path: String,
+    pub sync_detection_timeout: Duration,
     pub tasks: BTreeMap<String, Task>,
 }
 
@@ -28,6 +31,7 @@ struct RawConfig {
     rpc_port: u16,
     #[serde(default = "default_remote_bin_path")]
     remote_bin_path: String,
+    sync_detection_timeout: Option<String>,
     #[serde(default)]
     tasks: BTreeMap<String, RawTask>,
 }
@@ -36,6 +40,9 @@ struct RawConfig {
 pub struct Task {
     pub run: TaskRun,
     pub description: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
+    pub timeout: Option<Duration>,
     pub vars: BTreeMap<String, TaskVar>,
 }
 
@@ -65,6 +72,10 @@ pub struct TaskVar {
 struct RawDetailedTask {
     run: RawTaskRun,
     description: Option<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    timeout: Option<String>,
     #[serde(default)]
     vars: BTreeMap<String, RawTaskVar>,
 }
@@ -120,14 +131,17 @@ impl Config {
             if task == "tasks-help" {
                 bail!("config task name `tasks-help` is reserved");
             }
-            task_def.validate(task)?;
+            if task == "checkhealth" {
+                bail!("config task name `checkhealth` is reserved");
+            }
+            task_def.validate(task, &self.local_root)?;
         }
         Ok(())
     }
 }
 
 impl Task {
-    fn validate(&self, task_name: &str) -> Result<()> {
+    fn validate(&self, task_name: &str, local_root: &Path) -> Result<()> {
         match &self.run {
             TaskRun::String(command) => {
                 if command.trim().is_empty() {
@@ -145,6 +159,25 @@ impl Task {
                     validate_argv(task_name, argv)?;
                 }
             }
+        }
+
+        if let Some(cwd) = &self.cwd {
+            if cwd.is_absolute() {
+                bail!("config task `{task_name}` cwd must be relative to local_root");
+            }
+            let resolved = normalize_relative_path(cwd)
+                .with_context(|| format!("config task `{task_name}` cwd escapes local_root"))?;
+            let _ = local_root.join(resolved);
+        }
+
+        for (name, value) in &self.env {
+            if !is_valid_env_name(name) {
+                bail!(
+                    "config task `{task_name}` has invalid env var `{name}`; names must match [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+            validate_template(value)
+                .with_context(|| format!("config task `{task_name}` has invalid env template"))?;
         }
 
         for (name, var) in &self.vars {
@@ -205,6 +238,9 @@ impl Task {
                 }
             }
         }
+        for value in self.env.values() {
+            visit(value)?;
+        }
         Ok(())
     }
 
@@ -239,8 +275,12 @@ impl Task {
 }
 
 impl RawConfig {
-    fn resolve(self, project_root: &Path) -> Config {
-        Config {
+    fn resolve(self, project_root: &Path) -> Result<Config> {
+        let sync_detection_timeout = match self.sync_detection_timeout {
+            Some(value) => parse_duration(&value)?,
+            None => DEFAULT_SYNC_DETECTION_TIMEOUT,
+        };
+        Ok(Config {
             ssh_target: self.ssh_target,
             local_root: self
                 .local_root
@@ -248,49 +288,65 @@ impl RawConfig {
             remote_root: self.remote_root,
             rpc_port: self.rpc_port,
             remote_bin_path: self.remote_bin_path,
+            sync_detection_timeout,
             tasks: self
                 .tasks
                 .into_iter()
-                .map(|(name, task)| (name, task.resolve()))
-                .collect(),
-        }
+                .map(|(name, task)| Ok((name, task.resolve()?)))
+                .collect::<Result<_>>()?,
+        })
     }
 }
 
 impl RawTask {
-    fn resolve(self) -> Task {
-        match self {
+    fn resolve(self) -> Result<Task> {
+        Ok(match self {
             Self::String(command) => Task {
                 run: TaskRun::String(command),
                 description: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::new(),
             },
             Self::Command(argv) => Task {
                 run: TaskRun::Command(argv),
                 description: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::new(),
             },
             Self::Sequence(steps) => Task {
                 run: TaskRun::Sequence(steps),
                 description: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::new(),
             },
-            Self::Detailed(task) => task.resolve(),
-        }
+            Self::Detailed(task) => task.resolve()?,
+        })
     }
 }
 
 impl RawDetailedTask {
-    fn resolve(self) -> Task {
-        Task {
+    fn resolve(self) -> Result<Task> {
+        Ok(Task {
             run: self.run.resolve(),
             description: self.description,
+            cwd: self.cwd,
+            env: self.env,
+            timeout: self
+                .timeout
+                .map(|value| parse_duration(&value))
+                .transpose()?,
             vars: self
                 .vars
                 .into_iter()
                 .map(|(name, var)| (name, var.resolve()))
                 .collect(),
-        }
+        })
     }
 }
 
@@ -422,6 +478,33 @@ fn is_valid_name(name: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn is_valid_env_name(name: &str) -> bool {
+    is_valid_name(name)
+}
+
+fn normalize_relative_path(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(segment) => normalized.push(segment),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path escapes project root");
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!("absolute paths are not allowed");
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn parse_duration(value: &str) -> Result<Duration> {
+    humantime::parse_duration(value).with_context(|| format!("invalid duration `{value}`"))
+}
+
 pub fn discover_config(start_dir: &Path) -> Result<LoadedConfig> {
     let mut current = fs::canonicalize(start_dir)
         .with_context(|| format!("failed to canonicalize {}", start_dir.display()))?;
@@ -432,7 +515,7 @@ pub fn discover_config(start_dir: &Path) -> Result<LoadedConfig> {
                 .with_context(|| format!("failed to read {}", candidate.display()))?;
             let raw_config: RawConfig = toml::from_str(&text)
                 .with_context(|| format!("failed to parse {}", candidate.display()))?;
-            let config = raw_config.resolve(&current);
+            let config = raw_config.resolve(&current)?;
             config.validate()?;
             return Ok(LoadedConfig {
                 config,
@@ -471,6 +554,7 @@ test = ["cargo", "test"]
             remote_root: PathBuf::from("/tmp/remote"),
             rpc_port: DEFAULT_RPC_PORT,
             remote_bin_path: DEFAULT_REMOTE_BIN_PATH.to_string(),
+            sync_detection_timeout: DEFAULT_SYNC_DETECTION_TIMEOUT,
             tasks: BTreeMap::new(),
         };
         assert!(config.validate().is_err());
@@ -512,7 +596,7 @@ test = ["cargo", "test"]
         let raw: RawConfig =
             toml::from_str(include_str!("../examples/minimal.sshpal.toml")).unwrap();
         let project_root = Path::new("/tmp/example-project");
-        let config = raw.resolve(project_root);
+        let config = raw.resolve(project_root).unwrap();
         config.validate().unwrap();
         assert_eq!(config.local_root, project_root);
         assert_eq!(config.remote_root, PathBuf::from("/work/project"));
@@ -520,10 +604,17 @@ test = ["cargo", "test"]
         assert_eq!(config.rpc_port, DEFAULT_RPC_PORT);
         assert_eq!(config.remote_bin_path, DEFAULT_REMOTE_BIN_PATH);
         assert_eq!(
+            config.sync_detection_timeout,
+            DEFAULT_SYNC_DETECTION_TIMEOUT
+        );
+        assert_eq!(
             config.tasks.get("test").unwrap(),
             &Task {
                 run: TaskRun::Command(vec!["bin/test".to_string()]),
                 description: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::new(),
             }
         );
@@ -534,12 +625,13 @@ test = ["cargo", "test"]
         let raw: RawConfig =
             toml::from_str(include_str!("../examples/complete.sshpal.toml")).unwrap();
         let project_root = Path::new("/tmp/example-project");
-        let config = raw.resolve(project_root);
+        let config = raw.resolve(project_root).unwrap();
         config.validate().unwrap();
         assert_eq!(config.local_root, PathBuf::from("/tmp/local-worktree"));
         assert_eq!(config.remote_root, PathBuf::from("/work/project"));
         assert_eq!(config.rpc_port, 40_001);
         assert_eq!(config.remote_bin_path, "~/bin/sshpal-run-custom");
+        assert_eq!(config.sync_detection_timeout, Duration::from_secs(15));
         assert_eq!(
             config.tasks.get("lint").unwrap(),
             &Task {
@@ -550,6 +642,9 @@ test = ["cargo", "test"]
                     "--strict".to_string()
                 ]),
                 description: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::new(),
             }
         );
@@ -568,7 +663,7 @@ check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
         )
         .unwrap();
 
-        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let config = raw.resolve(Path::new("/tmp/example-project")).unwrap();
         config.validate().unwrap();
         assert_eq!(
             config.tasks.get("check").unwrap(),
@@ -582,6 +677,9 @@ check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
                     vec!["cargo".to_string(), "test".to_string()]
                 ]),
                 description: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::new(),
             }
         );
@@ -604,13 +702,16 @@ description = "Cargo package name"
         )
         .unwrap();
 
-        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let config = raw.resolve(Path::new("/tmp/example-project")).unwrap();
         config.validate().unwrap();
         assert_eq!(
             config.tasks.get("build").unwrap(),
             &Task {
                 run: TaskRun::String("cargo build --package '{#crate}'".to_string()),
                 description: Some("Build one package".to_string()),
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout: None,
                 vars: BTreeMap::from([(
                     "crate".to_string(),
                     TaskVar {
@@ -638,7 +739,7 @@ description = "Cargo package name"
         )
         .unwrap();
 
-        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let config = raw.resolve(Path::new("/tmp/example-project")).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("documents var `crate` but never references it"));
     }
@@ -656,7 +757,7 @@ run = ["cargo", "build", "--package", "{#crate}"]
         )
         .unwrap();
 
-        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let config = raw.resolve(Path::new("/tmp/example-project")).unwrap();
         config.validate().unwrap();
         assert_eq!(
             config
@@ -682,7 +783,7 @@ run = "cargo build {crate}"
         )
         .unwrap();
 
-        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let config = raw.resolve(Path::new("/tmp/example-project")).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("invalid run string"));
     }
@@ -700,7 +801,7 @@ tasks-help = ["printf", "nope"]
         )
         .unwrap();
 
-        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let config = raw.resolve(Path::new("/tmp/example-project")).unwrap();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("reserved"));
     }

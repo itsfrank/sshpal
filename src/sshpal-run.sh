@@ -11,6 +11,20 @@ if ! command -v curl >/dev/null 2>&1; then
 	exit 1
 fi
 
+discover_project_root() {
+	current=$(pwd)
+	while :; do
+		if [ -f "$current/.sshpal.toml" ]; then
+			printf '%s\n' "$current"
+			return 0
+		fi
+		if [ "$current" = "/" ]; then
+			return 1
+		fi
+		current=$(dirname "$current")
+	done
+}
+
 task=$1
 shift
 
@@ -27,10 +41,34 @@ if [ "$task" = "tasks-help" ]; then
 	exit $?
 fi
 
+if [ "$task" = "checkhealth" ]; then
+	if [ "$#" -ne 0 ]; then
+		echo "usage: sshpal-run checkhealth" >&2
+		exit 2
+	fi
+	curl \
+		--silent \
+		--show-error \
+		--fail-with-body \
+		"http://127.0.0.1:__SSHPAL_RPC_PORT__/checkhealth"
+	exit $?
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
 	echo "sshpal-run requires jq on the remote host" >&2
 	exit 1
 fi
+
+project_root=$(discover_project_root) || {
+	echo "sshpal-run could not find .sshpal.toml from $(pwd) upward" >&2
+	exit 1
+}
+
+sync_dir="$project_root/.sshpal"
+sync_file="$sync_dir/sync-token"
+mkdir -p "$sync_dir"
+sync_token="$(date +%s)-$$"
+printf '%s\n' "$sync_token" >"$sync_file"
 
 is_valid_var_name() {
 	case "$1" in
@@ -71,7 +109,7 @@ while [ "$#" -gt 0 ]; do
 	shift
 done
 
-payload=$(jq -cn --arg task "$task" --argjson vars "$vars_json" --args "$@" '{task: $task, vars: $vars, args: $ARGS.positional}')
+payload=$(jq -cn --arg task "$task" --arg sync_token "$sync_token" --argjson vars "$vars_json" '{task: $task, sync_token: $sync_token, vars: $vars, args: $ARGS.positional}' --args -- "$@")
 
 tmpdir=$(mktemp -d)
 rpc_fifo="$tmpdir/rpc-stream"
@@ -94,9 +132,9 @@ curl_pid=$!
 
 jq -r '
     if .type == "stdout" then
-        "stdout\t" + (.chunk | @base64)
+        "stdout\t" + .chunk_b64
     elif .type == "stderr" then
-        "stderr\t" + (.chunk | @base64)
+        "stderr\t" + .chunk_b64
     elif .type == "exit" then
         "exit\t" + (.code | tostring)
     else
@@ -110,10 +148,10 @@ tab=$(printf '\t')
 while IFS="$tab" read -r kind payload; do
 	case "$kind" in
 	stdout)
-		printf '%s' "$payload" | jq -Rr '@base64d'
+		printf '%s' "$payload" | jq -Rrj '@base64d'
 		;;
 	stderr)
-		printf '%s' "$payload" | jq -Rr '@base64d' >&2
+		printf '%s' "$payload" | jq -Rrj '@base64d' >&2
 		;;
 	exit)
 		exit_code=$payload

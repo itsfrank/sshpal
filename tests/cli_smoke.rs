@@ -23,6 +23,14 @@ optional = true
 [tasks.quick]
 run = "printf 'quick task\\n'"
 description = "Run a quick command"
+
+[tasks.cwd_env]
+run = ["sh", "-c", "printf '%s|%s' \"$PWD\" \"$SPECIAL\""]
+cwd = "."
+timeout = "5s"
+
+[tasks.cwd_env.env]
+SPECIAL = "hello-env"
 "#,
     )
     .unwrap();
@@ -38,6 +46,7 @@ fn binary_help_succeeds() {
             "Sync files and proxy local-only tasks through SSH",
         ))
         .stdout(predicate::str::contains("serve"))
+        .stdout(predicate::str::contains("checkhealth"))
         .stdout(predicate::str::contains("other-run").not())
         .stdout(predicate::str::contains("install-remote").not());
 }
@@ -81,4 +90,20 @@ fn local_run_executes_task_with_vars_and_forwarded_args() {
         .assert()
         .success()
         .stdout("hello world||tail\n");
+}
+
+#[test]
+fn local_run_applies_task_cwd_and_env() {
+    let temp = tempfile::tempdir().unwrap();
+    write_task_config(temp.path());
+
+    let mut cmd = Command::cargo_bin("sshpal").unwrap();
+    cmd.current_dir(temp.path())
+        .args(["run", "cwd_env"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            temp.path().to_string_lossy().as_ref(),
+        ))
+        .stdout(predicate::str::contains("|hello-env"));
 }

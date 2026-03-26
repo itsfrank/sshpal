@@ -3,6 +3,7 @@ local_root = "/tmp/local-worktree" # optional (default: directory containing thi
 remote_root = "/work/project"
 rpc_port = 40001 # optional (default: 45678)
 remote_bin_path = "~/bin/sshpal-run-custom" # optional (default: ~/.local/bin/sshpal-run)
+sync_detection_timeout = "15s" # optional (default: 10s)
 
 [tasks]
 test = ["bin/test"]
@@ -12,6 +13,11 @@ check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
 [tasks.build]
 run = "cargo build --package '{#crate}'"
 description = "Build one Cargo package"
+cwd = "."
+timeout = "10m"
+
+[tasks.build.env]
+RUST_BACKTRACE = "1"
 
 [tasks.build.vars.crate]
 description = "Cargo package name"

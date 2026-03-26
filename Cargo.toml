@@ -7,8 +7,10 @@ edition = "2024"
 anyhow = "1.0.98"
 async-stream = "0.3.6"
 axum = "0.8.4"
+base64 = "0.22.1"
 clap = { version = "4.5.40", features = ["derive"] }
 futures-util = "0.3.31"
+humantime = "2.2.0"
 http = "1.3.1"
 reqwest = { version = "0.12.15", default-features = false, features = ["http2", "json", "rustls-tls", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }

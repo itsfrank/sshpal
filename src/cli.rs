@@ -6,8 +6,10 @@ use std::{fs, time::SystemTime};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::process::Command;
+use tokio::time;
 
 use crate::config::discover_config;
+use crate::health;
 use crate::paths::{SyncDirection, build_sync_plan, relative_cwd};
 use crate::process::{
     SharedRunner, SystemRunner, install_copy_command, install_finalize_command,
@@ -35,6 +37,7 @@ enum Commands {
         args: Vec<String>,
     },
     TasksHelp,
+    Checkhealth,
 }
 
 pub async fn run() -> Result<i32> {
@@ -49,6 +52,7 @@ async fn run_with(cli: Cli, runner: SharedRunner) -> Result<i32> {
         Commands::Serve => serve_with(runner).await,
         Commands::Run { task, args } => run_task(task, args).await,
         Commands::TasksHelp => tasks_help(),
+        Commands::Checkhealth => checkhealth(),
     }
 }
 
@@ -86,7 +90,7 @@ async fn serve_with(runner: SharedRunner) -> Result<i32> {
         loaded.config.rpc_port
     );
 
-    let server_result = rpc::serve(loaded.config).await;
+    let server_result = rpc::serve(loaded).await;
     let _ = tunnel.kill().await;
     server_result?;
     Ok(0)
@@ -123,6 +127,13 @@ fn tasks_help() -> Result<i32> {
     Ok(0)
 }
 
+fn checkhealth() -> Result<i32> {
+    let loaded = discover_config(&std::env::current_dir()?)?;
+    let report = health::checkhealth(&loaded)?;
+    println!("{}", report.text);
+    Ok(if report.ok { 0 } else { 1 })
+}
+
 async fn run_task(task_name: String, args: Vec<String>) -> Result<i32> {
     let loaded = discover_config(&std::env::current_dir()?)?;
     let invocation = tasks::parse_invocation_args(&args)?;
@@ -134,6 +145,7 @@ async fn run_task(task_name: String, args: Vec<String>) -> Result<i32> {
     let prepared = tasks::prepare_task(
         &task_name,
         task,
+        &loaded.config.local_root,
         &invocation.vars,
         &invocation.forwarded_args,
     )?;
@@ -145,12 +157,20 @@ async fn run_task(task_name: String, args: Vec<String>) -> Result<i32> {
         };
         let status = Command::new(program)
             .args(step.iter().skip(1))
+            .current_dir(&prepared.cwd)
+            .envs(&prepared.env)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .status()
-            .await
-            .with_context(|| format!("failed to spawn task `{task_name}`"))?;
+            .status();
+        let status = if let Some(timeout) = prepared.timeout {
+            time::timeout(timeout, status)
+                .await
+                .with_context(|| format!("task `{task_name}` timed out after {}", humantime::format_duration(timeout)))?
+        } else {
+            status.await
+        }
+        .with_context(|| format!("failed to spawn task `{task_name}`"))?;
         exit_code = status.code().unwrap_or(1);
         if exit_code != 0 {
             break;

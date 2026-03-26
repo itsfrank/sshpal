@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::config::Config;
 use crate::paths::{SyncDirection, SyncPlan};
@@ -90,11 +90,7 @@ pub fn rsync_command(config: &Config, plan: &SyncPlan) -> CommandSpec {
             dest = format!("{}:{}", config.ssh_target, plan.remote_path.display()).into();
         }
         SyncDirection::Pull => {
-            source = rsync_remote_source(
-                &config.ssh_target,
-                &plan.remote_path,
-                plan.source_is_dir,
-            );
+            source = rsync_remote_source(&config.ssh_target, &plan.remote_path, plan.source_is_dir);
             dest = plan.local_path.as_os_str().to_os_string();
         }
     }
@@ -144,7 +140,11 @@ pub fn install_prepare_command(config: &Config) -> CommandSpec {
 pub fn install_copy_command(config: &Config, artifact: &OsStr) -> CommandSpec {
     CommandSpec::new("scp").args([
         artifact.to_os_string(),
-        OsString::from(format!("{}:{}", config.ssh_target, remote_staging_path(config))),
+        OsString::from(format!(
+            "{}:{}",
+            config.ssh_target,
+            remote_staging_path(config)
+        )),
     ])
 }
 
@@ -233,6 +233,7 @@ mod tests {
             remote_root: PathBuf::from("/remote"),
             rpc_port: 12345,
             remote_bin_path: "~/.local/bin/sshpal-run".to_string(),
+            sync_detection_timeout: std::time::Duration::from_secs(10),
             tasks: BTreeMap::new(),
         }
     }
@@ -291,16 +292,12 @@ mod tests {
             copy.args[1].to_string_lossy(),
             "me@example:/tmp/sshpal-run-12345.tmp"
         );
-        assert!(
-            prep.args[1]
-                .to_string_lossy()
-                .contains("dirname \"$HOME/.local/bin/sshpal-run\"")
-        );
-        assert!(
-            fin.args[1]
-                .to_string_lossy()
-                .contains("mv '/tmp/sshpal-run-12345.tmp' \"$HOME/.local/bin/sshpal-run\"")
-        );
+        assert!(prep.args[1]
+            .to_string_lossy()
+            .contains("dirname \"$HOME/.local/bin/sshpal-run\""));
+        assert!(fin.args[1]
+            .to_string_lossy()
+            .contains("mv '/tmp/sshpal-run-12345.tmp' \"$HOME/.local/bin/sshpal-run\""));
     }
 
     #[test]

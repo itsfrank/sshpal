@@ -1,15 +1,21 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
 use crate::config::{parse_template, Placeholder, Task, TaskRun, TemplatePart};
 
 pub const TASKS_HELP_NAME: &str = "tasks-help";
+pub const CHECKHEALTH_NAME: &str = "checkhealth";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTask {
     pub steps: Vec<Vec<String>>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +64,7 @@ pub fn parse_invocation_args(args: &[String]) -> Result<InvocationArgs> {
 pub fn prepare_task(
     task_name: &str,
     task: &Task,
+    local_root: &Path,
     vars: &BTreeMap<String, String>,
     forwarded_args: &[String],
 ) -> Result<PreparedTask> {
@@ -80,7 +87,23 @@ pub fn prepare_task(
         last.extend(forwarded_args.iter().cloned());
     }
 
-    Ok(PreparedTask { steps })
+    let cwd = task
+        .cwd
+        .as_ref()
+        .map(|cwd| local_root.join(cwd))
+        .unwrap_or_else(|| local_root.to_path_buf());
+    let env = task
+        .env
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), render_template(task_name, value, task, vars)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    Ok(PreparedTask {
+        steps,
+        cwd,
+        env,
+        timeout: task.timeout,
+    })
 }
 
 pub fn task_help(command_name: &str, tasks: &BTreeMap<String, Task>) -> Result<String> {
@@ -273,6 +296,9 @@ mod tests {
         Task {
             run,
             description: Some("Example task".to_string()),
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout: None,
             vars: BTreeMap::new(),
         }
     }
@@ -289,6 +315,9 @@ mod tests {
                 "{#crate}".to_string(),
             ]),
             description: None,
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout: None,
             vars: BTreeMap::from([(
                 "crate".to_string(),
                 crate::config::TaskVar {
@@ -298,7 +327,14 @@ mod tests {
             )]),
         };
 
-        let prepared = prepare_task("test", &task, &vars, &["--nocapture".to_string()]).unwrap();
+        let prepared = prepare_task(
+            "test",
+            &task,
+            Path::new("/tmp/project"),
+            &vars,
+            &["--nocapture".to_string()],
+        )
+        .unwrap();
 
         assert_eq!(
             prepared.steps,
@@ -319,6 +355,9 @@ mod tests {
         let task = Task {
             run: TaskRun::String("cargo test --package '{#crate}'".to_string()),
             description: None,
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout: None,
             vars: BTreeMap::from([(
                 "crate".to_string(),
                 crate::config::TaskVar {
@@ -328,7 +367,7 @@ mod tests {
             )]),
         };
 
-        let prepared = prepare_task("test", &task, &vars, &[]).unwrap();
+        let prepared = prepare_task("test", &task, Path::new("/tmp/project"), &vars, &[]).unwrap();
         assert_eq!(
             prepared.steps,
             vec![vec![
@@ -345,6 +384,9 @@ mod tests {
         let task = Task {
             run: TaskRun::Command(vec!["cmd".to_string(), "{#label}".to_string()]),
             description: None,
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout: None,
             vars: BTreeMap::from([(
                 "label".to_string(),
                 crate::config::TaskVar {
@@ -354,7 +396,14 @@ mod tests {
             )]),
         };
 
-        let prepared = prepare_task("test", &task, &BTreeMap::new(), &[]).unwrap();
+        let prepared = prepare_task(
+            "test",
+            &task,
+            Path::new("/tmp/project"),
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(prepared.steps, vec![vec!["cmd".to_string(), String::new()]]);
     }
 
@@ -370,6 +419,9 @@ mod tests {
                 "{#target}".to_string(),
             ]),
             description: Some("Build one crate".to_string()),
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout: None,
             vars: BTreeMap::from([(
                 "crate".to_string(),
                 crate::config::TaskVar {

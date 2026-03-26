@@ -62,6 +62,8 @@ Place it at the project root. `sshpal` will walk upward from your current direct
   - default: `45678`
 - `remote_bin_path`
   - default: `"~/.local/bin/sshpal-run"`
+- `sync_detection_timeout`
+  - default: `10s`
 - `tasks`
   - default: empty
 
@@ -84,12 +86,17 @@ Structured tasks add descriptions and documented variables:
 [tasks.build]
 run = "cargo build --package '{#crate}'"
 description = "Build one Cargo package"
+cwd = "."
+timeout = "10m"
+
+[tasks.build.env]
+RUST_BACKTRACE = "1"
 
 [tasks.build.vars.crate]
 description = "Cargo package name"
 ```
 
-Task variables use `{#name}` placeholders. Environment variables use `{$NAME}`. Use `{{` and `}}` for literal braces.
+Task variables use `{#name}` placeholders. Environment variables use `{$NAME}`. Use `{{` and `}}` for literal braces. Structured tasks may also set `cwd`, `timeout`, and `[tasks.<name>.env]`.
 
 String tasks are split into argv with shell-like quoting, but `sshpal` does not execute them through a shell. If you want shell semantics, invoke `sh -c` explicitly.
 
@@ -151,6 +158,10 @@ sshpal run build crate="my crate"
 
 Arguments before `--` must be `name=value`. Arguments after `--` are forwarded to the final step only.
 
+### `sshpal checkhealth`
+
+Run local and remote setup checks for the current project. This validates config discovery, required local tools, task working directories, RPC port availability, and remote helper prerequisites.
+
 ### `sshpal tasks-help`
 
 Print generated task documentation for the current project.
@@ -195,7 +206,10 @@ On the remote machine:
 sshpal-run test
 sshpal-run build crate=my-crate
 sshpal-run tasks-help
+sshpal-run checkhealth
 ```
+
+Normal remote task execution now waits for a synced sentinel file at `.sshpal/sync-token` before running the local task. `sshpal` stays sync-tool agnostic: it does not perform synchronization itself, but it waits up to `sync_detection_timeout` for the token written on the remote machine to appear locally. `tasks-help` and `checkhealth` bypass this sync wait.
 
 Tasks can be defined as a string command, a single command array, or a sequence of command arrays. For sequential tasks, commands run in order and stop on the first non-zero exit code. Client-provided vars use `name=value` before `--`. Any extra args passed after `--` are appended to the final command in the sequence.
 
