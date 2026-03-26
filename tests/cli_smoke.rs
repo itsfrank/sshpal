@@ -1,5 +1,32 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+
+fn write_task_config(dir: &std::path::Path) {
+    fs::write(
+        dir.join(".sshpal.toml"),
+        r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks.render]
+run = ["sh", "-c", "printf '%s|%s|%s\n' \"$0\" \"$1\" \"$2\"", "{#name}", "{#mode}"]
+description = "Render a formatted line"
+
+[tasks.render.vars.name]
+description = "Value to print"
+
+[tasks.render.vars.mode]
+description = "Rendering mode"
+optional = true
+
+[tasks.quick]
+run = "printf 'quick task\\n'"
+description = "Run a quick command"
+"#,
+    )
+    .unwrap();
+}
 
 #[test]
 fn binary_help_succeeds() {
@@ -24,4 +51,34 @@ fn binary_reports_missing_config() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no .sshpal.toml found"));
+}
+
+#[test]
+fn tasks_help_lists_local_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    write_task_config(temp.path());
+
+    let mut cmd = Command::cargo_bin("sshpal").unwrap();
+    cmd.current_dir(temp.path())
+        .arg("tasks-help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "usage: sshpal run render name=<value> [mode=<value>] [-- <args...>]",
+        ))
+        .stdout(predicate::str::contains("Render a formatted line"))
+        .stdout(predicate::str::contains("run: printf 'quick task\\n'"));
+}
+
+#[test]
+fn local_run_executes_task_with_vars_and_forwarded_args() {
+    let temp = tempfile::tempdir().unwrap();
+    write_task_config(temp.path());
+
+    let mut cmd = Command::cargo_bin("sshpal").unwrap();
+    cmd.current_dir(temp.path())
+        .args(["run", "render", "name=hello world", "--", "tail"])
+        .assert()
+        .success()
+        .stdout("hello world||tail\n");
 }

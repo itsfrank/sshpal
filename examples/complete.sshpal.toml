@@ -8,3 +8,10 @@ remote_bin_path = "~/bin/sshpal-run-custom" # optional (default: ~/.local/bin/ss
 test = ["bin/test"]
 lint = ["bin/lint", "--format", "json", "--strict"]
 check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
+
+[tasks.build]
+run = "cargo build --package '{#crate}'"
+description = "Build one Cargo package"
+
+[tasks.build.vars.crate]
+description = "Cargo package name"

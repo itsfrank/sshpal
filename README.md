@@ -5,7 +5,7 @@
 It provides two main features:
 
 - project-aware `push` / `pull` commands built on `rsync`
-- a local RPC server so the remote machine can trigger local-only tasks such as macOS-only tests through an installed `sshpal-run` helper
+- a local RPC server so the remote machine can trigger local-only tasks such as macOS-only tests through an installed `sshpal-run` helper, with documented task inputs and generated task help
 
 ## What It Does
 
@@ -65,6 +65,34 @@ Place it at the project root. `sshpal` will walk upward from your current direct
 - `tasks`
   - default: empty
 
+### Task formats
+
+Tasks support both shorthand and structured forms.
+
+Shorthand examples:
+
+```toml
+[tasks]
+test = ["cargo", "test"]
+check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
+dev = "bun run dev"
+```
+
+Structured tasks add descriptions and documented variables:
+
+```toml
+[tasks.build]
+run = "cargo build --package '{#crate}'"
+description = "Build one Cargo package"
+
+[tasks.build.vars.crate]
+description = "Cargo package name"
+```
+
+Task variables use `{#name}` placeholders. Environment variables use `{$NAME}`. Use `{{` and `}}` for literal braces.
+
+String tasks are split into argv with shell-like quoting, but `sshpal` does not execute them through a shell. If you want shell semantics, invoke `sh -c` explicitly.
+
 ### Config examples
 
 - Minimal example: [examples/minimal.sshpal.toml](/Users/frk/dev/sshpal/examples/minimal.sshpal.toml)
@@ -104,6 +132,29 @@ If the port is already in use, `sshpal` fails with guidance to:
 - shut down existing `sshpal` servers
 - or choose another port with `rpc_port` in config
 
+### `sshpal run <task> [name=value ...] [-- <args...>]`
+
+Run a configured task locally using the same task model as the remote helper.
+
+Examples:
+
+```sh
+sshpal run build crate=my-crate
+sshpal run build crate=my-crate -- --release
+```
+
+Values with spaces use normal shell quoting:
+
+```sh
+sshpal run build crate="my crate"
+```
+
+Arguments before `--` must be `name=value`. Arguments after `--` are forwarded to the final step only.
+
+### `sshpal tasks-help`
+
+Print generated task documentation for the current project.
+
 ## Example Workflow
 
 ### 1. Add config
@@ -117,6 +168,13 @@ remote_root = "/work/project"
 [tasks]
 test = ["bin/test"]
 check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
+
+[tasks.build]
+run = "cargo build --package '{#crate}'"
+description = "Build one Cargo package"
+
+[tasks.build.vars.crate]
+description = "Cargo package name"
 ```
 
 ### 2. Start the local daemon
@@ -135,9 +193,11 @@ On the remote machine:
 
 ```sh
 sshpal-run test
+sshpal-run build crate=my-crate
+sshpal-run tasks-help
 ```
 
-Tasks can be defined as either a single command array or a sequence of command arrays. For sequential tasks, commands run in order and stop on the first non-zero exit code. Any extra args passed to `sshpal-run <task> ...` are appended to the final command in the sequence.
+Tasks can be defined as a string command, a single command array, or a sequence of command arrays. For sequential tasks, commands run in order and stop on the first non-zero exit code. Client-provided vars use `name=value` before `--`. Any extra args passed after `--` are appended to the final command in the sequence.
 
 ### 4. Sync files in either direction
 

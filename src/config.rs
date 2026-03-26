@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 pub const CONFIG_FILE_NAME: &str = ".sshpal.toml";
@@ -34,14 +34,54 @@ struct RawConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
-    pub steps: Vec<Vec<String>>,
+    pub run: TaskRun,
+    pub description: Option<String>,
+    pub vars: BTreeMap<String, TaskVar>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 enum RawTask {
+    String(String),
     Command(Vec<String>),
     Sequence(Vec<Vec<String>>),
+    Detailed(RawDetailedTask),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskRun {
+    String(String),
+    Command(Vec<String>),
+    Sequence(Vec<Vec<String>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskVar {
+    pub description: Option<String>,
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RawDetailedTask {
+    run: RawTaskRun,
+    description: Option<String>,
+    #[serde(default)]
+    vars: BTreeMap<String, RawTaskVar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum RawTaskRun {
+    String(String),
+    Command(Vec<String>),
+    Sequence(Vec<Vec<String>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RawTaskVar {
+    description: Option<String>,
+    #[serde(default)]
+    optional: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -77,16 +117,124 @@ impl Config {
             if task.trim().is_empty() {
                 bail!("config task names must not be empty");
             }
-            if task_def.steps.is_empty() {
-                bail!("config task `{task}` must define at least one command");
+            if task == "tasks-help" {
+                bail!("config task name `tasks-help` is reserved");
             }
-            for argv in &task_def.steps {
-                if argv.is_empty() || argv[0].trim().is_empty() {
-                    bail!("config task `{task}` must define non-empty command arrays");
+            task_def.validate(task)?;
+        }
+        Ok(())
+    }
+}
+
+impl Task {
+    fn validate(&self, task_name: &str) -> Result<()> {
+        match &self.run {
+            TaskRun::String(command) => {
+                if command.trim().is_empty() {
+                    bail!("config task `{task_name}` must define a non-empty command string");
+                }
+                validate_template(command)
+                    .with_context(|| format!("config task `{task_name}` has invalid run string"))?;
+            }
+            TaskRun::Command(argv) => validate_argv(task_name, argv)?,
+            TaskRun::Sequence(steps) => {
+                if steps.is_empty() {
+                    bail!("config task `{task_name}` must define at least one command");
+                }
+                for argv in steps {
+                    validate_argv(task_name, argv)?;
+                }
+            }
+        }
+
+        for (name, var) in &self.vars {
+            if name.trim().is_empty() {
+                bail!("config task `{task_name}` has an empty documented var name");
+            }
+            if !is_valid_name(name) {
+                bail!(
+                    "config task `{task_name}` documents invalid var `{name}`; names must match [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+            if let Some(description) = &var.description {
+                if description.trim().is_empty() {
+                    bail!("config task `{task_name}` var `{name}` description must not be empty");
+                }
+            }
+        }
+
+        let referenced = self.referenced_client_vars()?;
+        for documented in self.vars.keys() {
+            if !referenced.contains(documented) {
+                bail!("config task `{task_name}` documents var `{documented}` but never references it in run");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn referenced_client_vars(&self) -> Result<Vec<String>> {
+        self.referenced_placeholders(|placeholder| match placeholder {
+            Placeholder::Client(name) => Some(name),
+            Placeholder::Env(_) => None,
+        })
+    }
+
+    pub fn referenced_env_vars(&self) -> Result<Vec<String>> {
+        self.referenced_placeholders(|placeholder| match placeholder {
+            Placeholder::Client(_) => None,
+            Placeholder::Env(name) => Some(name),
+        })
+    }
+
+    fn visit_templates<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        match &self.run {
+            TaskRun::String(command) => visit(command)?,
+            TaskRun::Command(argv) => {
+                for arg in argv {
+                    visit(arg)?;
+                }
+            }
+            TaskRun::Sequence(steps) => {
+                for step in steps {
+                    for arg in step {
+                        visit(arg)?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    pub fn steps(&self) -> Vec<Vec<String>> {
+        match &self.run {
+            TaskRun::String(command) => vec![vec![command.clone()]],
+            TaskRun::Command(argv) => vec![argv.clone()],
+            TaskRun::Sequence(steps) => steps.clone(),
+        }
+    }
+
+    fn referenced_placeholders<F>(&self, mut pick: F) -> Result<Vec<String>>
+    where
+        F: FnMut(Placeholder) -> Option<String>,
+    {
+        let mut names = Vec::new();
+        self.visit_templates(|template| {
+            let refs = parse_template(template)?;
+            for reference in refs {
+                if let TemplatePart::Placeholder(placeholder) = reference {
+                    if let Some(name) = pick(placeholder) {
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(names)
     }
 }
 
@@ -112,10 +260,166 @@ impl RawConfig {
 impl RawTask {
     fn resolve(self) -> Task {
         match self {
-            Self::Command(argv) => Task { steps: vec![argv] },
-            Self::Sequence(steps) => Task { steps },
+            Self::String(command) => Task {
+                run: TaskRun::String(command),
+                description: None,
+                vars: BTreeMap::new(),
+            },
+            Self::Command(argv) => Task {
+                run: TaskRun::Command(argv),
+                description: None,
+                vars: BTreeMap::new(),
+            },
+            Self::Sequence(steps) => Task {
+                run: TaskRun::Sequence(steps),
+                description: None,
+                vars: BTreeMap::new(),
+            },
+            Self::Detailed(task) => task.resolve(),
         }
     }
+}
+
+impl RawDetailedTask {
+    fn resolve(self) -> Task {
+        Task {
+            run: self.run.resolve(),
+            description: self.description,
+            vars: self
+                .vars
+                .into_iter()
+                .map(|(name, var)| (name, var.resolve()))
+                .collect(),
+        }
+    }
+}
+
+impl RawTaskRun {
+    fn resolve(self) -> TaskRun {
+        match self {
+            Self::String(command) => TaskRun::String(command),
+            Self::Command(argv) => TaskRun::Command(argv),
+            Self::Sequence(steps) => TaskRun::Sequence(steps),
+        }
+    }
+}
+
+impl RawTaskVar {
+    fn resolve(self) -> TaskVar {
+        TaskVar {
+            description: self.description,
+            optional: self.optional,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TemplatePart {
+    Literal(String),
+    Placeholder(Placeholder),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Placeholder {
+    Client(String),
+    Env(String),
+}
+
+fn validate_argv(task_name: &str, argv: &[String]) -> Result<()> {
+    if argv.is_empty() {
+        bail!("config task `{task_name}` must define at least one command");
+    }
+    if argv[0].trim().is_empty() {
+        bail!("config task `{task_name}` must define non-empty command arrays");
+    }
+    for arg in argv {
+        validate_template(arg)
+            .with_context(|| format!("config task `{task_name}` has invalid argv template"))?;
+    }
+    Ok(())
+}
+
+fn validate_template(template: &str) -> Result<()> {
+    let _ = parse_template(template)?;
+    Ok(())
+}
+
+pub(crate) fn parse_template(template: &str) -> Result<Vec<TemplatePart>> {
+    let chars = template.chars().collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        match chars[index] {
+            '{' => {
+                if let Some(next) = chars.get(index + 1) {
+                    match next {
+                        '{' => {
+                            literal.push('{');
+                            index += 2;
+                        }
+                        '#' | '$' => {
+                            if !literal.is_empty() {
+                                parts.push(TemplatePart::Literal(std::mem::take(&mut literal)));
+                            }
+                            let kind = *next;
+                            index += 2;
+                            let start = index;
+                            while index < chars.len() && chars[index] != '}' {
+                                index += 1;
+                            }
+                            if index >= chars.len() {
+                                bail!("unterminated placeholder in `{template}`");
+                            }
+                            let name = chars[start..index].iter().collect::<String>();
+                            if !is_valid_name(&name) {
+                                bail!(
+                                    "invalid placeholder name `{name}` in `{template}`; names must match [A-Za-z_][A-Za-z0-9_]*"
+                                );
+                            }
+                            let placeholder = if kind == '#' {
+                                Placeholder::Client(name)
+                            } else {
+                                Placeholder::Env(name)
+                            };
+                            parts.push(TemplatePart::Placeholder(placeholder));
+                            index += 1;
+                        }
+                        _ => bail!("invalid placeholder start in `{template}`; use `{{`, `{{#name}}`, or `{{$NAME}}`")
+                    }
+                } else {
+                    bail!("unterminated `{{` in `{template}`");
+                }
+            }
+            '}' => {
+                if chars.get(index + 1) == Some(&'}') {
+                    literal.push('}');
+                    index += 2;
+                } else {
+                    bail!("unescaped `}}` in `{template}`; use `}}}}` for a literal closing brace");
+                }
+            }
+            ch => {
+                literal.push(ch);
+                index += 1;
+            }
+        }
+    }
+
+    if !literal.is_empty() {
+        parts.push(TemplatePart::Literal(literal));
+    }
+    Ok(parts)
+}
+
+fn is_valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 pub fn discover_config(start_dir: &Path) -> Result<LoadedConfig> {
@@ -218,7 +522,9 @@ test = ["cargo", "test"]
         assert_eq!(
             config.tasks.get("test").unwrap(),
             &Task {
-                steps: vec![vec!["bin/test".to_string()]]
+                run: TaskRun::Command(vec!["bin/test".to_string()]),
+                description: None,
+                vars: BTreeMap::new(),
             }
         );
     }
@@ -237,12 +543,14 @@ test = ["cargo", "test"]
         assert_eq!(
             config.tasks.get("lint").unwrap(),
             &Task {
-                steps: vec![vec![
+                run: TaskRun::Command(vec![
                     "bin/lint".to_string(),
                     "--format".to_string(),
                     "json".to_string(),
                     "--strict".to_string()
-                ]]
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
             }
         );
     }
@@ -265,15 +573,135 @@ check = [["cargo", "fmt", "--check"], ["cargo", "test"]]
         assert_eq!(
             config.tasks.get("check").unwrap(),
             &Task {
-                steps: vec![
+                run: TaskRun::Sequence(vec![
                     vec![
                         "cargo".to_string(),
                         "fmt".to_string(),
                         "--check".to_string()
                     ],
                     vec!["cargo".to_string(), "test".to_string()]
-                ]
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
             }
         );
+    }
+
+    #[test]
+    fn parses_structured_task_with_docs_and_vars() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks.build]
+run = "cargo build --package '{#crate}'"
+description = "Build one package"
+
+[tasks.build.vars.crate]
+description = "Cargo package name"
+"#,
+        )
+        .unwrap();
+
+        let config = raw.resolve(Path::new("/tmp/example-project"));
+        config.validate().unwrap();
+        assert_eq!(
+            config.tasks.get("build").unwrap(),
+            &Task {
+                run: TaskRun::String("cargo build --package '{#crate}'".to_string()),
+                description: Some("Build one package".to_string()),
+                vars: BTreeMap::from([(
+                    "crate".to_string(),
+                    TaskVar {
+                        description: Some("Cargo package name".to_string()),
+                        optional: false,
+                    },
+                )]),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unused_documented_vars() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks.build]
+run = ["cargo", "build"]
+
+[tasks.build.vars.crate]
+description = "Cargo package name"
+"#,
+        )
+        .unwrap();
+
+        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("documents var `crate` but never references it"));
+    }
+
+    #[test]
+    fn accepts_undocumented_referenced_vars() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks.build]
+run = ["cargo", "build", "--package", "{#crate}"]
+"#,
+        )
+        .unwrap();
+
+        let config = raw.resolve(Path::new("/tmp/example-project"));
+        config.validate().unwrap();
+        assert_eq!(
+            config
+                .tasks
+                .get("build")
+                .unwrap()
+                .referenced_client_vars()
+                .unwrap(),
+            vec!["crate".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_placeholders() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks.build]
+run = "cargo build {crate}"
+"#,
+        )
+        .unwrap();
+
+        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("invalid run string"));
+    }
+
+    #[test]
+    fn rejects_reserved_task_name() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+ssh_target = "me@example"
+remote_root = "/remote/project"
+
+[tasks]
+tasks-help = ["printf", "nope"]
+"#,
+        )
+        .unwrap();
+
+        let config = raw.resolve(Path::new("/tmp/example-project"));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved"));
     }
 }

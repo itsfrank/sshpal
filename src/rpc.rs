@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -18,10 +18,13 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::config::{Config, Task};
+use crate::tasks;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcRequest {
     pub task: String,
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
 }
@@ -50,6 +53,7 @@ pub async fn serve(config: Config) -> Result<()> {
     };
     let app = Router::new()
         .route("/run", post(run_task))
+        .route("/tasks-help", get(tasks_help))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.rpc_port));
@@ -88,18 +92,19 @@ async fn run_task(
             format!("unknown task `{}`", request.task),
         )
     })?;
+    let prepared = tasks::prepare_task(&request.task, &task, &request.vars, &request.args)
+        .map_err(|err| RpcResponseError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let body_stream = stream! {
         let mut exit_code = 0;
 
-        for (index, step) in task.steps.iter().enumerate() {
-            let argv = augment_step(step.clone(), &request.args, index + 1 == task.steps.len());
+        for (index, argv) in prepared.steps.iter().enumerate() {
             eprintln!(
                 "sshpal: starting step {}/{} for `{}`: {}",
                 index + 1,
-                task.steps.len(),
+                prepared.steps.len(),
                 request.task,
-                format_step(&argv)
+                format_step(argv)
             );
 
             let Some(program) = argv.first().cloned() else {
@@ -110,7 +115,7 @@ async fn run_task(
                 exit_code = 1;
                 break;
             };
-            let args = argv.into_iter().skip(1).collect::<Vec<_>>();
+            let args = argv.iter().skip(1).cloned().collect::<Vec<_>>();
 
             let mut child = match Command::new(program)
                 .args(args)
@@ -191,19 +196,17 @@ async fn run_task(
     Ok(response)
 }
 
+async fn tasks_help(State(state): State<RpcState>) -> Result<String, RpcResponseError> {
+    tasks::task_help("sshpal-run", &state.tasks)
+        .map_err(|err| RpcResponseError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
 fn format_invocation_args(args: &[String]) -> String {
     if args.is_empty() {
         String::new()
     } else {
         format!(" with args [{}]", args.join(", "))
     }
-}
-
-fn augment_step(mut step: Vec<String>, args: &[String], is_final_step: bool) -> Vec<String> {
-    if is_final_step {
-        step.extend(args.iter().cloned());
-    }
-    step
 }
 
 fn format_step(argv: &[String]) -> String {
@@ -267,37 +270,43 @@ mod tests {
         tasks.insert(
             "test".to_string(),
             Task {
-                steps: vec![vec![
+                run: crate::config::TaskRun::Command(vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "echo out; echo err >&2; exit 7".to_string(),
-                ]],
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
             },
         );
         tasks.insert(
             "slow".to_string(),
             Task {
-                steps: vec![vec![
+                run: crate::config::TaskRun::Command(vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "echo first; sleep 0.2; echo second; exit 0".to_string(),
-                ]],
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
             },
         );
         tasks.insert(
             "no_newline".to_string(),
             Task {
-                steps: vec![vec![
+                run: crate::config::TaskRun::Command(vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "printf out".to_string(),
-                ]],
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
             },
         );
         tasks.insert(
             "sequence".to_string(),
             Task {
-                steps: vec![
+                run: crate::config::TaskRun::Sequence(vec![
                     vec![
                         "sh".to_string(),
                         "-c".to_string(),
@@ -308,13 +317,15 @@ mod tests {
                         "-c".to_string(),
                         "echo second \"$0\"; exit 0".to_string(),
                     ],
-                ],
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
             },
         );
         tasks.insert(
             "sequence_fails".to_string(),
             Task {
-                steps: vec![
+                run: crate::config::TaskRun::Sequence(vec![
                     vec![
                         "sh".to_string(),
                         "-c".to_string(),
@@ -330,7 +341,28 @@ mod tests {
                         "-c".to_string(),
                         "echo after-fail".to_string(),
                     ],
-                ],
+                ]),
+                description: None,
+                vars: BTreeMap::new(),
+            },
+        );
+        tasks.insert(
+            "templated".to_string(),
+            Task {
+                run: crate::config::TaskRun::Command(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf '%s' \"$0\"".to_string(),
+                    "{#value}".to_string(),
+                ]),
+                description: Some("Render one value".to_string()),
+                vars: BTreeMap::from([(
+                    "value".to_string(),
+                    crate::config::TaskVar {
+                        description: Some("Value to render".to_string()),
+                        optional: false,
+                    },
+                )]),
             },
         );
         Config {
@@ -346,6 +378,7 @@ mod tests {
     async fn collect_events(
         config: &Config,
         task: &str,
+        vars: BTreeMap<String, String>,
         args: Vec<String>,
     ) -> Result<Vec<RpcEvent>> {
         let url = format!("http://127.0.0.1:{}/run", config.rpc_port);
@@ -354,6 +387,7 @@ mod tests {
             .post(url)
             .json(&RpcRequest {
                 task: task.to_string(),
+                vars,
                 args,
             })
             .send()
@@ -383,10 +417,29 @@ mod tests {
         Ok(events)
     }
 
+    async fn collect_task_help(config: &Config) -> Result<String> {
+        let url = format!("http://127.0.0.1:{}/tasks-help", config.rpc_port);
+        let response = Client::builder()
+            .build()?
+            .get(url)
+            .send()
+            .await
+            .context("failed to contact local RPC daemon")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            bail!("RPC request failed: {status} {text}");
+        }
+
+        response.text().await.context("failed to read help response")
+    }
+
     #[tokio::test]
     async fn rpc_serializes() {
         let req = RpcRequest {
             task: "test".to_string(),
+            vars: BTreeMap::from([("name".to_string(), "value".to_string())]),
             args: vec!["a".to_string()],
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -401,7 +454,9 @@ mod tests {
         let server_cfg = cfg.clone();
         let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
         sleep(Duration::from_millis(100)).await;
-        let events = collect_events(&cfg, "test", Vec::new()).await.unwrap();
+        let events = collect_events(&cfg, "test", BTreeMap::new(), Vec::new())
+            .await
+            .unwrap();
         handle.abort();
         assert_eq!(
             events,
@@ -424,7 +479,7 @@ mod tests {
         let server_cfg = cfg.clone();
         let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
         sleep(Duration::from_millis(100)).await;
-        let err = collect_events(&cfg, "missing", Vec::new())
+        let err = collect_events(&cfg, "missing", BTreeMap::new(), Vec::new())
             .await
             .unwrap_err();
         handle.abort();
@@ -438,7 +493,12 @@ mod tests {
         let server_cfg = cfg.clone();
         let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
         sleep(Duration::from_millis(100)).await;
-        let events = collect_events(&cfg, "sequence", vec!["arg".to_string()])
+        let events = collect_events(
+            &cfg,
+            "sequence",
+            BTreeMap::new(),
+            vec!["arg".to_string()],
+        )
             .await
             .unwrap();
         handle.abort();
@@ -463,7 +523,7 @@ mod tests {
         let server_cfg = cfg.clone();
         let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
         sleep(Duration::from_millis(100)).await;
-        let events = collect_events(&cfg, "sequence_fails", Vec::new())
+        let events = collect_events(&cfg, "sequence_fails", BTreeMap::new(), Vec::new())
             .await
             .unwrap();
         handle.abort();
@@ -485,8 +545,49 @@ mod tests {
     fn remote_helper_script_embeds_port_and_command_name() {
         let script = remote_helper_script(45678);
         assert!(script.starts_with("#!/bin/sh"));
-        assert!(script.contains("usage: sshpal-run <task> [args...]"));
+        assert!(script.contains("usage: sshpal-run <task> [name=value ...] [-- <args...>]"));
         assert!(script.contains("http://127.0.0.1:45678/run"));
+        assert!(script.contains("http://127.0.0.1:45678/tasks-help"));
+    }
+
+    #[tokio::test]
+    async fn run_endpoint_substitutes_client_vars() {
+        let port = 49005;
+        let cfg = config_for(port);
+        let server_cfg = cfg.clone();
+        let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
+        sleep(Duration::from_millis(100)).await;
+        let events = collect_events(
+            &cfg,
+            "templated",
+            BTreeMap::from([("value".to_string(), "hello world".to_string())]),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        handle.abort();
+        assert_eq!(
+            events,
+            vec![
+                RpcEvent::Stdout {
+                    chunk: "hello world\n".to_string()
+                },
+                RpcEvent::Exit { code: 0 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_help_route_returns_remote_usage() {
+        let port = 49006;
+        let cfg = config_for(port);
+        let server_cfg = cfg.clone();
+        let handle = tokio::spawn(async move { serve(server_cfg).await.unwrap() });
+        sleep(Duration::from_millis(100)).await;
+        let help = collect_task_help(&cfg).await.unwrap();
+        handle.abort();
+        assert!(help.contains("usage: sshpal-run templated value=<value> [-- <args...>]"));
+        assert!(help.contains("Render one value"));
     }
 
     #[tokio::test]

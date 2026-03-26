@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 #[test]
 #[ignore = "requires Docker, image pulls, and network access"]
@@ -23,7 +23,9 @@ fn ubuntu_container_remote_client_replays_output_and_exit_code() -> Result<()> {
         "unexpected remote exit status\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("from stdout\nsecond stdout line\nPROMPT\n"),
+        stdout.contains(
+            "usage: sshpal-run test [-- <args...>]\nfrom stdout\nsecond stdout line\nPROMPT\n"
+        ),
         "stdout from stub daemon did not preserve newlines: {stdout}"
     );
     assert!(
@@ -83,6 +85,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 PORT = {port}
 
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/tasks-help':
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b'usage: sshpal-run test [-- <args...>]\n')
+
     def do_POST(self):
         if self.path != '/run':
             self.send_response(404)
@@ -129,13 +141,14 @@ fn run_remote_container(project_dir: &Path) -> Result<std::process::Output> {
          trap 'kill $stub_pid 2>/dev/null || true' EXIT; \
          sleep 1; \
          if ! kill -0 $stub_pid 2>/dev/null; then \
-             cat /tmp/rpc_stub.log >&2 || true; \
-             exit 1; \
-         fi; \
-         cd /project; \
-         set +e; \
-         sshpal-run test; \
-         status=$?; \
+              cat /tmp/rpc_stub.log >&2 || true; \
+              exit 1; \
+          fi; \
+          cd /project; \
+          sshpal-run tasks-help; \
+          set +e; \
+          sshpal-run test; \
+          status=$?; \
          set -e; \
          printf 'PROMPT\n'; \
          if [ $status -ne 0 ]; then \

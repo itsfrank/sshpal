@@ -2,42 +2,94 @@
 set -eu
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: sshpal-run <task> [args...]" >&2
-    exit 2
+	echo "usage: sshpal-run <task> [name=value ...] [-- <args...>]" >&2
+	exit 2
 fi
 
 if ! command -v curl >/dev/null 2>&1; then
-    echo "sshpal-run requires curl on the remote host" >&2
-    exit 1
-fi
-
-if ! command -v jq >/dev/null 2>&1; then
-    echo "sshpal-run requires jq on the remote host" >&2
-    exit 1
+	echo "sshpal-run requires curl on the remote host" >&2
+	exit 1
 fi
 
 task=$1
 shift
 
-payload=$(jq -cn --arg task "$task" --args "$@" '{task: $task, args: $ARGS.positional}')
+if [ "$task" = "tasks-help" ]; then
+	if [ "$#" -ne 0 ]; then
+		echo "usage: sshpal-run tasks-help" >&2
+		exit 2
+	fi
+	curl \
+		--silent \
+		--show-error \
+		--fail-with-body \
+		"http://127.0.0.1:__SSHPAL_RPC_PORT__/tasks-help"
+	exit $?
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+	echo "sshpal-run requires jq on the remote host" >&2
+	exit 1
+fi
+
+is_valid_var_name() {
+	case "$1" in
+	'' | [0-9]* | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*)
+		return 1
+		;;
+	*)
+		return 0
+		;;
+	esac
+}
+
+vars_json='{}'
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--)
+		shift
+		break
+		;;
+	*=*)
+		key=${1%%=*}
+		value=${1#*=}
+		if ! is_valid_var_name "$key"; then
+			echo "invalid task variable: $key" >&2
+			exit 2
+		fi
+		vars_json=$(jq -cn \
+			--argjson vars "$vars_json" \
+			--arg key "$key" \
+			--arg value "$value" \
+			'$vars + {($key): $value}')
+		;;
+	*)
+		echo "invalid task argument: $1 (use name=value before --)" >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+payload=$(jq -cn --arg task "$task" --argjson vars "$vars_json" --args "$@" '{task: $task, vars: $vars, args: $ARGS.positional}')
 
 tmpdir=$(mktemp -d)
 rpc_fifo="$tmpdir/rpc-stream"
 event_fifo="$tmpdir/event-stream"
 mkfifo "$rpc_fifo" "$event_fifo"
 cleanup() {
-    rm -rf "$tmpdir"
+	rm -rf "$tmpdir"
 }
 trap cleanup EXIT HUP INT TERM
 
 curl \
-    --silent \
-    --show-error \
-    --no-buffer \
-    --fail-with-body \
-    -H 'Content-Type: application/json' \
-    -d "$payload" \
-    "http://127.0.0.1:__SSHPAL_RPC_PORT__/run" >"$rpc_fifo" &
+	--silent \
+	--show-error \
+	--no-buffer \
+	--fail-with-body \
+	-H 'Content-Type: application/json' \
+	-d "$payload" \
+	"http://127.0.0.1:__SSHPAL_RPC_PORT__/run" >"$rpc_fifo" &
 curl_pid=$!
 
 jq -r '
@@ -56,46 +108,46 @@ jq_pid=$!
 exit_code=
 tab=$(printf '\t')
 while IFS="$tab" read -r kind payload; do
-    case "$kind" in
-        stdout)
-            printf '%s' "$payload" | jq -Rr '@base64d'
-            ;;
-        stderr)
-            printf '%s' "$payload" | jq -Rr '@base64d' >&2
-            ;;
-        exit)
-            exit_code=$payload
-            ;;
-        *)
-            echo "unknown RPC event kind: $kind" >&2
-            exit 1
-            ;;
-    esac
+	case "$kind" in
+	stdout)
+		printf '%s' "$payload" | jq -Rr '@base64d'
+		;;
+	stderr)
+		printf '%s' "$payload" | jq -Rr '@base64d' >&2
+		;;
+	exit)
+		exit_code=$payload
+		;;
+	*)
+		echo "unknown RPC event kind: $kind" >&2
+		exit 1
+		;;
+	esac
 done <"$event_fifo"
 
 if wait "$jq_pid"; then
-    parser_status=0
+	parser_status=0
 else
-    parser_status=$?
+	parser_status=$?
 fi
 
 if wait "$curl_pid"; then
-    curl_status=0
+	curl_status=0
 else
-    curl_status=$?
+	curl_status=$?
 fi
 
 if [ "$curl_status" -ne 0 ]; then
-    exit "$curl_status"
+	exit "$curl_status"
 fi
 
 if [ "$parser_status" -ne 0 ]; then
-    exit "$parser_status"
+	exit "$parser_status"
 fi
 
 if [ -z "$exit_code" ]; then
-    echo "RPC stream ended without exit event" >&2
-    exit 1
+	echo "RPC stream ended without exit event" >&2
+	exit 1
 fi
 
 exit "$exit_code"

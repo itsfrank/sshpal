@@ -14,6 +14,7 @@ use crate::process::{
     install_prepare_command, reverse_tunnel_command, rsync_command,
 };
 use crate::rpc;
+use crate::tasks;
 
 #[derive(Debug, Parser)]
 #[command(name = "sshpal")]
@@ -28,22 +29,30 @@ enum Commands {
     Push { path: PathBuf },
     Pull { path: PathBuf },
     Serve,
+    Run {
+        task: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    TasksHelp,
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run() -> Result<i32> {
     let cli = Cli::parse();
     run_with(cli, Arc::new(SystemRunner)).await
 }
 
-async fn run_with(cli: Cli, runner: SharedRunner) -> Result<()> {
+async fn run_with(cli: Cli, runner: SharedRunner) -> Result<i32> {
     match cli.command {
         Commands::Push { path } => sync(path, SyncDirection::Push, runner),
         Commands::Pull { path } => sync(path, SyncDirection::Pull, runner),
         Commands::Serve => serve_with(runner).await,
+        Commands::Run { task, args } => run_task(task, args).await,
+        Commands::TasksHelp => tasks_help(),
     }
 }
 
-fn sync(path: PathBuf, direction: SyncDirection, runner: SharedRunner) -> Result<()> {
+fn sync(path: PathBuf, direction: SyncDirection, runner: SharedRunner) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     let loaded = discover_config(&cwd)?;
     let cwd_rel = relative_cwd(&loaded.config.local_root, &cwd)?;
@@ -54,10 +63,11 @@ fn sync(path: PathBuf, direction: SyncDirection, runner: SharedRunner) -> Result
         &path,
         direction,
     )?;
-    runner.run(&rsync_command(&loaded.config, &plan))
+    runner.run(&rsync_command(&loaded.config, &plan))?;
+    Ok(0)
 }
 
-async fn serve_with(runner: SharedRunner) -> Result<()> {
+async fn serve_with(runner: SharedRunner) -> Result<i32> {
     let loaded = discover_config(&std::env::current_dir()?)?;
     eprintln!(
         "sshpal: installing remote helper to {} on {}",
@@ -78,7 +88,8 @@ async fn serve_with(runner: SharedRunner) -> Result<()> {
 
     let server_result = rpc::serve(loaded.config).await;
     let _ = tunnel.kill().await;
-    server_result
+    server_result?;
+    Ok(0)
 }
 
 fn install_remote_helper(config: &crate::config::Config, runner: SharedRunner) -> Result<()> {
@@ -104,6 +115,49 @@ fn write_local_helper_script(contents: String) -> Result<PathBuf> {
     let path = std::env::temp_dir().join(format!("sshpal-run-{nanos}.tmp"));
     fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
+}
+
+fn tasks_help() -> Result<i32> {
+    let loaded = discover_config(&std::env::current_dir()?)?;
+    println!("{}", tasks::task_help("sshpal run", &loaded.config.tasks)?);
+    Ok(0)
+}
+
+async fn run_task(task_name: String, args: Vec<String>) -> Result<i32> {
+    let loaded = discover_config(&std::env::current_dir()?)?;
+    let invocation = tasks::parse_invocation_args(&args)?;
+    let task = loaded
+        .config
+        .tasks
+        .get(&task_name)
+        .with_context(|| format!("unknown task `{task_name}`"))?;
+    let prepared = tasks::prepare_task(
+        &task_name,
+        task,
+        &invocation.vars,
+        &invocation.forwarded_args,
+    )?;
+
+    let mut exit_code = 0;
+    for step in prepared.steps {
+        let Some(program) = step.first() else {
+            return Ok(1);
+        };
+        let status = Command::new(program)
+            .args(step.iter().skip(1))
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("failed to spawn task `{task_name}`"))?;
+        exit_code = status.code().unwrap_or(1);
+        if exit_code != 0 {
+            break;
+        }
+    }
+
+    Ok(exit_code)
 }
 
 #[cfg(test)]
@@ -155,7 +209,7 @@ remote_root = "/remote/proj"
         let _guard = CwdGuard::change_to(&sub);
         let runner = Arc::new(RecordingRunner::default());
         let cli = Cli::parse_from(["sshpal", "push", "."]);
-        run_with(cli, runner.clone()).await.unwrap();
+        assert_eq!(run_with(cli, runner.clone()).await.unwrap(), 0);
         let specs = runner.take();
         assert_eq!(specs[0].program.to_string_lossy(), "rsync");
         assert!(specs[0].args[4].to_string_lossy().ends_with("/proj/a/b/"));
@@ -172,7 +226,7 @@ remote_root = "/remote/proj"
         let _guard = CwdGuard::change_to(&sub);
         let runner = Arc::new(RecordingRunner::default());
         let cli = Cli::parse_from(["sshpal", "pull", "."]);
-        run_with(cli, runner.clone()).await.unwrap();
+        assert_eq!(run_with(cli, runner.clone()).await.unwrap(), 0);
         let specs = runner.take();
         assert_eq!(specs[0].program.to_string_lossy(), "rsync");
         assert!(
@@ -213,5 +267,32 @@ remote_root = "/remote/proj"
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "echo test\n");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn run_subcommand_keeps_var_and_forwarded_args() {
+        let cli = Cli::parse_from([
+            "sshpal",
+            "run",
+            "build",
+            "crate=my crate",
+            "--",
+            "--nocapture",
+        ]);
+
+        match cli.command {
+            Commands::Run { task, args } => {
+                assert_eq!(task, "build");
+                assert_eq!(
+                    args,
+                    vec![
+                        "crate=my crate".to_string(),
+                        "--".to_string(),
+                        "--nocapture".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected run command"),
+        }
     }
 }

@@ -13,6 +13,7 @@ http = "1.3.1"
 reqwest = { version = "0.12.15", default-features = false, features = ["http2", "json", "rustls-tls", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+shell-words = "1.1.0"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-stream = "0.1.17"
 toml = "0.8.23"
